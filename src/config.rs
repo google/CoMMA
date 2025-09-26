@@ -96,6 +96,15 @@ pub struct Config {
     pub telemetry_mode: usize,
     pub heartbeat: bool,
     pub heartbeat_upload_interval: Duration,
+
+    // OpenTelemetry config
+    pub otel_enable: bool,
+    pub otel_trace_ncclop: bool,
+    // opentelemetry base2 histogram parameters
+    // see https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/metrics/sdk.md#base2-exponential-bucket-histogram-aggregation
+    // for more detail
+    pub otel_latency_histogram_max_size: u32,
+    pub otel_latency_histogram_max_scale: u32,
 }
 
 impl Config {
@@ -152,6 +161,11 @@ impl Config {
         #[cfg(feature = "explicit-optin")]
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 0);
 
+        field_from_env!(s, otel_enable, false);
+        field_from_env!(s, otel_trace_ncclop, false);
+        field_from_env!(s, otel_latency_histogram_max_size, 160);
+        field_from_env!(s, otel_latency_histogram_max_scale, 20);
+
         s
     }
 }
@@ -175,6 +189,7 @@ macro_rules! default_config_parser {
 
 default_config_parser!(String);
 default_config_parser!(usize);
+default_config_parser!(u32);
 default_config_parser!(f64);
 
 impl FromConfigStr for bool {

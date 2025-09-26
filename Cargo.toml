@@ -41,6 +41,9 @@ libc = "0.2.169"
 libloading = "0.8.6"
 log = "0.4.20"
 nom = "8.0.0"
+opentelemetry = "0.29"
+opentelemetry_sdk = { version = "0.29", features = ["trace", "metrics", "spec_unstable_metrics_views"] }
+opentelemetry-otlp = { version = "0.29", features = ["http-proto", "reqwest-blocking-client", "trace", "metrics", "logs", "internal-logs", "grpc-tonic"] }
 prost = "0.13.3"
 prost-types = "0.13.3"
 rand = "0.9.0"

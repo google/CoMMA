@@ -23,6 +23,7 @@ mod gcp_acs_proto; // copybara:strip(oss_protobuf)
 mod gpuviz;
 mod histogram;
 mod nccl_metadata;
+mod otel_utils;
 mod profiler;
 pub mod profiler_shim;
 mod shm_fifo;
