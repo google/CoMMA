@@ -103,6 +103,8 @@ pub struct Config {
     // opentelemetry base2 histogram parameters
     // see https://github.com/open-telemetry/opentelemetry-specification/blob/main/specification/metrics/sdk.md#base2-exponential-bucket-histogram-aggregation
     // for more detail
+    pub otel_metrics_max_cardinality: usize,
+    pub otel_metrics_cardinality_grouping_interval: Duration,
     pub otel_latency_histogram_max_size: u32,
     pub otel_latency_histogram_max_scale: u32,
 }
@@ -163,6 +165,12 @@ impl Config {
 
         field_from_env!(s, otel_enable, false);
         field_from_env!(s, otel_trace_ncclop, false);
+        field_from_env!(s, otel_metrics_max_cardinality, 0);
+        field_from_env!(
+            s,
+            otel_metrics_cardinality_grouping_interval,
+            Duration::from_secs(3600)
+        );
         field_from_env!(s, otel_latency_histogram_max_size, 160);
         field_from_env!(s, otel_latency_histogram_max_scale, 20);
 

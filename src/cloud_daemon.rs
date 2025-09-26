@@ -19,16 +19,19 @@ use crate::gcp_acs_proto;
 use crate::gpuviz;
 use crate::histogram::{Histogram1D, Histogram2D};
 use crate::nccl_metadata::NcclOpKey;
+use crate::otel_utils;
 use crate::profiler::Profiler;
+use crate::step_tracker::EventStep;
 
 use gcp_acs_proto::ntc::ActiveCommunicator;
 use gcp_acs_proto::ntc::ClosedCommunicator;
 use log::error;
 use serde_json::json;
 use std::collections::HashMap;
+use std::io::Error;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::time::{Duration, Instant};
 use tokio::fs::OpenOptions;
 use tokio::io::AsyncWriteExt;
@@ -252,6 +255,7 @@ async fn build_bufwriter(
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
+    otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
 ) -> std::io::Result<()> {
     let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
@@ -285,6 +289,14 @@ async fn exporter(
 
     let mut uploader_interval = tokio::time::interval(profiler.config.heartbeat_upload_interval);
     uploader_interval.tick().await;
+    let mut otel_metrics_grouping_interval = if profiler.config.otel_enable {
+        let mut i =
+            tokio::time::interval(profiler.config.otel_metrics_cardinality_grouping_interval);
+        i.tick().await;
+        Some(i)
+    } else {
+        None
+    };
 
     loop {
         tokio::select! {
@@ -345,6 +357,13 @@ async fn exporter(
                     gpuviz.send_heartbeat(summary.generate_heartbeat());
                 }
             },
+            _ = async { otel_metrics_grouping_interval.as_mut().unwrap().tick().await }, if otel_metrics_grouping_interval.is_some() => {
+                if let Some(manager) = otel_latency_hist_manager.as_ref() {
+                    if let Ok(mut inner) = manager.lock() {
+                        inner.update_priority();
+                    }
+                }
+            },
         }
     }
 
@@ -367,10 +386,25 @@ async fn exporter(
     Ok(())
 }
 
-impl Export for mpsc::Sender<Telemetry> {
+struct Exporter {
+    tx: mpsc::Sender<Telemetry>,
+    otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
+}
+
+impl Exporter {
+    #[cfg(test)]
+    fn new(tx: mpsc::Sender<Telemetry>) -> Self {
+        Self {
+            tx,
+            otel_latency_hist_manager: None,
+        }
+    }
+}
+
+impl Export for Exporter {
     fn export(&self, ctx: &mut PollingContext, maybe_retry_ms: Option<u64>) {
         while let Some(telemetry) = ctx.pending_telemetry.pop_front() {
-            if let Err(err) = self.try_send(telemetry) {
+            if let Err(err) = self.tx.try_send(telemetry) {
                 match err {
                     TrySendError::Full(v) => {
                         ctx.pending_telemetry.push_front(v);
@@ -392,21 +426,52 @@ impl Export for mpsc::Sender<Telemetry> {
             }
         }
     }
+
+    fn get_latency_histogram(
+        &self,
+        key: &NcclOpKey,
+    ) -> Option<impl std::iter::IntoIterator<Item = Arc<dyn AtomicHistogram<EventStep>>>> {
+        if let Some(manager) = self.otel_latency_hist_manager.as_ref() {
+            let mut lg = manager.lock().ok()?;
+            let h = Arc::new(lg.get_histogram(key.clone()));
+            Some(vec![h as _])
+        } else {
+            None
+        }
+    }
 }
 
 async fn main_loop(
     profiler: &'static Profiler,
     stop: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
+    if profiler.config.otel_enable {
+        otel_utils::init_meter_provider(&profiler.config)
+            .ok_or(Error::other("failed to init otel meter provider"))?;
+    }
     const TELEMETRY_CHANNEL_SZ: usize = 4096;
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);
-    let exporter = tokio::task::spawn(exporter(profiler, rx));
+    let otel_latency_hist_manager = if profiler.config.otel_enable {
+        Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
+            "nccl.net_send.latency",
+            "ns",
+            profiler.config.otel_metrics_max_cardinality,
+        ))))
+    } else {
+        None
+    };
+    let export_worker =
+        tokio::task::spawn(exporter(profiler, rx, otel_latency_hist_manager.clone()));
+    let exporter = Exporter {
+        tx,
+        otel_latency_hist_manager,
+    };
 
     let stop_signal = Arc::new(AtomicBool::new(false));
     let stop_signal_clone = stop_signal.clone();
     let polling_worker = tokio::task::spawn_blocking(move || {
         let mut polling_ctx = PollingContext::new(profiler, stop_signal_clone);
-        polling_loop(&mut polling_ctx, tx)
+        polling_loop(&mut polling_ctx, exporter)
     });
 
     let stop_signal_copy = stop_signal.clone();
@@ -427,7 +492,7 @@ async fn main_loop(
     if let Some(t) = timer_tick {
         let _ = t.join();
     }
-    exporter.await??;
+    export_worker.await??;
     Ok(())
 }
 
@@ -565,7 +630,7 @@ mod tests {
             let profiler_ref = &profiler;
             s.spawn(move || {
                 let mut ctx = PollingContext::new(profiler_ref, stop_var_clone);
-                polling_loop(&mut ctx, tx);
+                polling_loop(&mut ctx, Exporter::new(tx));
                 barr.wait();
                 assert_eq!(ctx.ncclops.len(), 0);
                 barr.wait();

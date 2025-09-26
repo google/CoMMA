@@ -12,8 +12,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#![allow(dead_code)]
-
 use crate::config;
 use crate::daemon::AtomicHistogram;
 use crate::nccl_metadata::NcclOpKey;
@@ -60,6 +58,7 @@ pub fn init_meter_provider(config: &config::Config) -> Option<()> {
 pub struct LatencyHistogram {
     inner: OtelHistogram<u64>,
     op_key: NcclOpKey,
+    hostname: Option<String>,
     high_fidelity: bool,
     local_counter: AtomicUsize,
     counter: Arc<AtomicUsize>,
@@ -69,12 +68,14 @@ impl LatencyHistogram {
     pub fn new(
         inner: OtelHistogram<u64>,
         op_key: NcclOpKey,
+        hostname: Option<String>,
         high_fidelity: bool,
         counter: Arc<AtomicUsize>,
     ) -> Self {
         Self {
             inner,
             op_key,
+            hostname,
             high_fidelity,
             local_counter: AtomicUsize::new(0),
             counter,
@@ -90,14 +91,19 @@ impl LatencyHistogram {
 impl AtomicHistogram<EventStep> for LatencyHistogram {
     fn record(&self, step: &EventStep) {
         if let NcclOpKey::NetSend(comm_hash, src, dst) = &self.op_key {
+            let hostname: String = self.hostname.clone().unwrap_or(String::from(""));
             let attributes: &[_] = if self.high_fidelity {
                 &[
                     KeyValue::new("nccl.communicator.hash", format!("0x{:016x}", comm_hash)),
                     KeyValue::new("nccl.source.rank", *src as i64),
                     KeyValue::new("nccl.destination.rank", *dst as i64),
+                    KeyValue::new("nccl.hostname", hostname),
                 ]
             } else {
-                &[KeyValue::new("nccl.metric.aggregated", true)]
+                &[
+                    KeyValue::new("nccl.metric.aggregated", true),
+                    KeyValue::new("nccl.hostname", hostname),
+                ]
             };
             self.inner.record(step.dur_ns as _, attributes);
         }
@@ -114,6 +120,27 @@ impl std::ops::Drop for LatencyHistogram {
     }
 }
 
+fn get_hostname_libc() -> Option<String> {
+    // hostname should be no longer than HOST_NAME_MAX, which is typically smaller than 256
+    let mut buf = [0 as libc::c_char; 257];
+
+    // SAFETY: gethostname will not overflow the buffer
+    let result = unsafe { libc::gethostname(buf.as_mut_ptr(), buf.len() - 1) };
+
+    // If truncation happens (though it shouldn't), gethostname() won't write the trailing null.
+    // So we write it to be safe
+    buf[256] = 0;
+
+    if result == 0 {
+        // Safely convert the null-terminated C string into a Rust String
+        let c_str = unsafe { std::ffi::CStr::from_ptr(buf.as_ptr()) };
+        Some(c_str.to_string_lossy().into_owned())
+    } else {
+        // If it fails, grab the last OS error (errno)
+        None
+    }
+}
+
 #[derive(Debug)]
 struct HistogramInfo {
     high_fidelity: bool, // This histogram is within top-k and should set all attributes
@@ -123,6 +150,7 @@ struct HistogramInfo {
 #[derive(Debug)]
 pub struct HistogramManager {
     histogram: OtelHistogram<u64>,
+    hostname: Option<String>,
     info: HashMap<NcclOpKey, HistogramInfo>,
     num_active: usize,
     cardinality_limit: usize,
@@ -136,6 +164,7 @@ impl HistogramManager {
                 .u64_histogram(String::from(name))
                 .with_unit(String::from(unit))
                 .build(),
+            hostname: get_hostname_libc(),
             info: HashMap::new(),
             num_active: 0,
             cardinality_limit,
@@ -157,6 +186,7 @@ impl HistogramManager {
         LatencyHistogram::new(
             self.histogram.clone(),
             key,
+            self.hostname.clone(),
             info.high_fidelity,
             info.counter.clone(),
         )
