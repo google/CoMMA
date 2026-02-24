@@ -146,8 +146,8 @@ impl Config {
         // copybara:strip_end
         #[cfg(not(feature = "explicit-optin"))]
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 3);
-        field_from_env!(s, heartbeat, false);
-        field_from_env!(s, heartbeat_upload_interval, Duration::from_secs(60));
+        field_from_env!(s, heartbeat, true);
+        field_from_env!(s, heartbeat_upload_interval, Duration::from_secs(10));
 
         #[cfg(feature = "explicit-optin")]
         field_from_env!(s, "NCCL_TELEMETRY_MODE", telemetry_mode, 0);
