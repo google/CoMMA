@@ -297,6 +297,15 @@ impl Connection {
     pub fn notify_profiler_event(&self, msg: *const u8, len: usize) -> std::io::Result<()> {
         // SAFETY: calling FFI function (expected to be MT safe)
         unsafe {
+            if self.notify_profiler_event.is_none() {
+                static WARN_LOG: std::sync::Once = std::sync::Once::new();
+                WARN_LOG.call_once(|| {
+                    log::warn!("cloud not load notify_profiler_event callback");
+                });
+                return Err(std::io::Error::other(
+                    "gpuviz notifyProfilerEvent not available",
+                ));
+            }
             let api = self.notify_profiler_event.unwrap();
             let r = api(self.handle, msg, len);
             if r == shim::ncclResult_t_ncclSuccess {
@@ -499,7 +508,7 @@ impl<C: AsRef<Connection> + From<Connection>> HistogramManager<C> {
     }
 
     pub fn send_heartbeat(&mut self, event: pb::ntc::Event) {
-        // this is blocked behind TELEMETRY_UPLOAD flag, but still make sure v2 is loaded
+        // this is blocked behind HEARTBEAT flag, but still make sure v2 is loaded
         if matches!(self.gpuviz.api, GpuvVizApi::V1(_)) || self.connections.is_empty() {
             return;
         }
