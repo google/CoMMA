@@ -25,10 +25,11 @@ use crate::step_tracker::EventStep;
 
 use gcp_acs_proto::ntc::ActiveCommunicator;
 use gcp_acs_proto::ntc::ClosedCommunicator;
+
 use log::error;
+use opentelemetry::global::BoxedTracer as OtelTracer;
 use serde_json::json;
 use std::collections::HashMap;
-use std::io::Error;
 use std::io::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, Once};
@@ -282,6 +283,13 @@ async fn exporter(
         .clone()
         .map(gpuviz::HistogramManager::new);
 
+    let mut otel_tracer: Option<OtelTracer> =
+        if profiler.config.otel_enable && profiler.config.otel_trace_ncclop {
+            Some(opentelemetry::global::tracer("CoMMA"))
+        } else {
+            None
+        };
+
     let mut summary_interval = tokio::time::interval(profiler.config.summary_interval);
 
     // the very first tick completes immediately
@@ -289,6 +297,7 @@ async fn exporter(
 
     let mut uploader_interval = tokio::time::interval(profiler.config.heartbeat_upload_interval);
     uploader_interval.tick().await;
+
     let mut otel_metrics_grouping_interval = if profiler.config.otel_enable {
         let mut i =
             tokio::time::interval(profiler.config.otel_metrics_cardinality_grouping_interval);
@@ -335,6 +344,12 @@ async fn exporter(
                                 let _ = gpuviz.add_ncclop(op, |t| {
                                     profiler.instant_to_timestamp(*t).as_nanos() as _
                                 });
+                            }
+                        }
+
+                        if let Some(otel_tracer) = otel_tracer.as_mut() {
+                            if let Telemetry::NcclOp(op) = &telemetry {
+                                let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
                             }
                         }
                     },
@@ -446,8 +461,12 @@ async fn main_loop(
     stop: oneshot::Receiver<()>,
 ) -> std::io::Result<()> {
     if profiler.config.otel_enable {
-        otel_utils::init_meter_provider(&profiler.config)
-            .ok_or(Error::other("failed to init otel meter provider"))?;
+        if otel_utils::init_meter_provider(&profiler.config).is_none() {
+            log::warn!("failed to init otel meter provider");
+        }
+        if otel_utils::init_tracer_provider(&profiler.config).is_none() {
+            log::warn!("failed to init otel tracer provider");
+        }
     }
     const TELEMETRY_CHANNEL_SZ: usize = 4096;
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);

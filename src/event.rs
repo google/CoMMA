@@ -269,7 +269,7 @@ impl NcclOp {
         self.id
     }
 
-    pub fn _get_descr(&self) -> &nccl_metadata::EventMetadata {
+    pub fn get_descr(&self) -> &nccl_metadata::EventMetadata {
         &self.descr
     }
 

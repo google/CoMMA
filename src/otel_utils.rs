@@ -14,20 +14,33 @@
 
 use crate::config;
 use crate::daemon::AtomicHistogram;
+use crate::event;
+use crate::event::ProfilerEvent as _;
+use crate::nccl_metadata;
 use crate::nccl_metadata::NcclOpKey;
+use crate::profiler::Profiler;
 use crate::step_tracker::EventStep;
 
+use opentelemetry::context::Context as OtelContext;
 use opentelemetry::metrics::Histogram as OtelHistogram;
-use opentelemetry::{global, KeyValue};
+use opentelemetry::trace::{
+    Span, SpanBuilder, SpanContext, SpanKind, TraceContextExt as _, TraceFlags, TraceState, Tracer,
+};
+use opentelemetry::{global, KeyValue, SpanId, TraceId};
 use opentelemetry_sdk::metrics::{new_view, Aggregation, Instrument, InstrumentKind, Stream};
 use opentelemetry_sdk::Resource;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, OnceLock};
+use std::time::{Duration, SystemTime};
 
 pub static RESOURCE: LazyLock<Resource> =
     LazyLock::new(|| Resource::builder().with_service_name("CoMMA").build());
+
+pub static METER_PROVIDER: OnceLock<opentelemetry_sdk::metrics::SdkMeterProvider> = OnceLock::new();
+
+pub static TRACER_PROVIDER: OnceLock<opentelemetry_sdk::trace::SdkTracerProvider> = OnceLock::new();
 
 pub fn init_meter_provider(config: &config::Config) -> Option<()> {
     let resource = &*RESOURCE;
@@ -49,8 +62,26 @@ pub fn init_meter_provider(config: &config::Config) -> Option<()> {
     if let Ok(view) = new_view(histogram_instrument, mask) {
         meter_provider_builder = meter_provider_builder.with_view(view);
     }
-    let meter_provider = meter_provider_builder.build();
+    let meter_provider = METER_PROVIDER.get_or_init(|| meter_provider_builder.build());
     global::set_meter_provider(meter_provider.clone());
+    Some(())
+}
+
+pub fn init_tracer_provider(_config: &config::Config) -> Option<()> {
+    let resource = &*RESOURCE;
+    let otlp_exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .build()
+        .ok()?;
+
+    // Create a tracer provider with the exporter
+    let provider = TRACER_PROVIDER.get_or_init(|| {
+        opentelemetry_sdk::trace::SdkTracerProvider::builder()
+            .with_resource(resource.clone())
+            .with_batch_exporter(otlp_exporter)
+            .build()
+    });
+    global::set_tracer_provider(provider.clone());
     Some(())
 }
 
@@ -207,6 +238,148 @@ impl HistogramManager {
     fn num_active(&self) -> usize {
         self.num_active
     }
+}
+
+fn coll_type_to_num(t: nccl_metadata::NcclOpType) -> u32 {
+    use nccl_metadata::NcclOpType as T;
+    match t {
+        T::Broadcast => 1,
+        T::Reduce => 2,
+        T::AllGather => 3,
+        T::ReduceScatter => 4,
+        T::AllReduce => 5,
+        _ => 0xabcd, // we don't use zero as zero span ID is invalid
+    }
+}
+
+fn ncclop_otel_name(op_type: nccl_metadata::NcclOpType) -> &'static str {
+    use nccl_metadata::NcclOpType;
+
+    match op_type {
+        NcclOpType::Broadcast => "ncclBroadcast",
+        NcclOpType::Reduce => "ncclReduce",
+        NcclOpType::AllGather => "ncclAllGather",
+        NcclOpType::ReduceScatter => "ncclReduceScatter",
+        NcclOpType::AllReduce => "ncclAllReduce",
+        NcclOpType::Send => "ncclSend",
+        NcclOpType::Recv => "ncclRecv",
+        _ => "unknown nccl op",
+    }
+}
+
+#[derive(Clone)]
+struct NcclOpAttr {
+    name: String,
+    start_time: SystemTime,
+    duration: Duration,
+    attributes: Vec<KeyValue>,
+}
+
+fn gen_ncclop_attributes(profiler: &Profiler, op: &event::NcclOp) -> Option<NcclOpAttr> {
+    let basic_info = op.basic_info();
+    let start_time = op.child_start_time()?;
+    let end_time = basic_info.end_time()?;
+    let duration = end_time - start_time;
+    let start_time = profiler.init_time + (start_time - profiler.init_instant);
+    let name;
+    let descr = op.get_descr();
+    let mut attributes = vec![
+        KeyValue::new("nccl.comm.hash", format!("0x{:016x}", op.comm_hash())),
+        KeyValue::new("nccl.rank", basic_info.rank() as i64),
+        KeyValue::new("nccl.size.bytes", op.byte_count() as i64),
+    ];
+    if let Some(coll) = descr.try_cast_to_coll() {
+        name = ncclop_otel_name(coll.op_type());
+        attributes.append(&mut vec![
+            KeyValue::new(
+                "nccl.collective.algo",
+                nccl_metadata::algo::name(coll.algo()),
+            ),
+            KeyValue::new(
+                "nccl.collective.proto",
+                nccl_metadata::proto::name(coll.proto()),
+            ),
+            KeyValue::new("nccl.collective.n_max_channel", coll.n_max_channel() as i64),
+        ]);
+    } else if let Some(p2p) = descr.try_cast_to_p2p() {
+        name = if p2p.is_send() {
+            "ncclSend"
+        } else {
+            "ncclRecv"
+        };
+        attributes.push(KeyValue::new("nccl.p2p.peer.rank", p2p.peer() as i64));
+    } else {
+        return None;
+    }
+
+    Some(NcclOpAttr {
+        name: name.to_string(),
+        start_time,
+        duration,
+        attributes,
+    })
+}
+
+pub fn add_ncclop_trace<T>(tracer: &mut T, profiler: &Profiler, op: &event::NcclOp) -> Option<()>
+where
+    T: Tracer,
+{
+    let attr = gen_ncclop_attributes(profiler, op)?;
+
+    let maybe_ctx = op.get_coll_descr().map(|coll| {
+        // create a parent
+        let trace_id = {
+            let comm_hash = op.comm_hash();
+            let encoded = comm_hash as u128;
+            TraceId::from_bytes(encoded.to_be_bytes())
+        };
+        let span_id = {
+            let coll_type = coll_type_to_num(coll.op_type());
+            let seq_num = coll.seq_num();
+            let encoded = ((coll_type as u64) << 32) | seq_num;
+            SpanId::from_bytes(encoded.to_be_bytes())
+        };
+        if op.basic_info().rank() == 0 {
+            // rank 0 should build the "parent span"
+            let attr = attr.clone();
+            let builder = SpanBuilder {
+                trace_id: Some(trace_id),
+                span_id: Some(span_id),
+                name: attr.name.into(),
+                start_time: Some(attr.start_time),
+                end_time: Some(attr.start_time + attr.duration), // use same duration as rank 0
+                span_kind: Some(SpanKind::Server),
+                attributes: Some(attr.attributes),
+                ..Default::default()
+            };
+            let mut parent = tracer.build(builder);
+            parent.end_with_timestamp(attr.start_time + attr.duration);
+        }
+        let parent = SpanContext::new(
+            trace_id,
+            span_id,
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        );
+        OtelContext::new().with_remote_span_context(parent)
+    });
+
+    let builder = SpanBuilder {
+        name: attr.name.into(),
+        start_time: Some(attr.start_time),
+        end_time: Some(attr.start_time + attr.duration),
+        span_kind: Some(SpanKind::Server),
+        attributes: Some(attr.attributes),
+        ..Default::default()
+    };
+    let mut span = if let Some(ctx) = maybe_ctx {
+        tracer.build_with_context(builder, &ctx)
+    } else {
+        tracer.build(builder)
+    };
+    span.end_with_timestamp(attr.start_time + attr.duration);
+    Some(())
 }
 
 #[cfg(test)]
