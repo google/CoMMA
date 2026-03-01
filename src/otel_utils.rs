@@ -22,6 +22,7 @@ use crate::profiler::Profiler;
 use crate::step_tracker::EventStep;
 
 use opentelemetry::context::Context as OtelContext;
+use opentelemetry::metrics::Gauge;
 use opentelemetry::metrics::Histogram as OtelHistogram;
 use opentelemetry::trace::{
     Span, SpanBuilder, SpanContext, SpanKind, TraceContextExt as _, TraceFlags, TraceState, Tracer,
@@ -379,6 +380,28 @@ where
         tracer.build(builder)
     };
     span.end_with_timestamp(attr.start_time + attr.duration);
+    Some(())
+}
+
+pub fn record_ncclop_seqnum(
+    gauge: &mut Gauge<i64>,
+    _profiler: &Profiler,
+    op: &event::NcclOp,
+) -> Option<()> {
+    let descr = op.get_descr();
+    if let Some(coll) = descr.try_cast_to_coll() {
+        let name = ncclop_otel_name(coll.op_type());
+        let hostname: String = get_hostname_libc().unwrap_or(String::from(""));
+        gauge.record(
+            coll.seq_num() as i64,
+            &[
+                KeyValue::new("nccl.comm.hash", format!("0x{:016x}", op.comm_hash())),
+                KeyValue::new("nccl.collective.name", name),
+                KeyValue::new("nccl.rank", coll.rank() as i64),
+                KeyValue::new("nccl.hostname", hostname),
+            ],
+        );
+    }
     Some(())
 }
 

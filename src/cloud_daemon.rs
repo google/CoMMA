@@ -28,6 +28,7 @@ use gcp_acs_proto::ntc::ClosedCommunicator;
 
 use log::error;
 use opentelemetry::global::BoxedTracer as OtelTracer;
+use opentelemetry::metrics::Gauge as OtelGauge;
 use serde_json::json;
 use std::collections::HashMap;
 use std::io::Write as _;
@@ -290,6 +291,13 @@ async fn exporter(
             None
         };
 
+    let mut otel_seqnum_gauge: Option<OtelGauge<i64>> = if profiler.config.otel_enable {
+        let meter = opentelemetry::global::meter("nccl");
+        Some(meter.i64_gauge("nccl.collective.seq_num").build())
+    } else {
+        None
+    };
+
     let mut summary_interval = tokio::time::interval(profiler.config.summary_interval);
 
     // the very first tick completes immediately
@@ -350,6 +358,12 @@ async fn exporter(
                         if let Some(otel_tracer) = otel_tracer.as_mut() {
                             if let Telemetry::NcclOp(op) = &telemetry {
                                 let _ = otel_utils::add_ncclop_trace(otel_tracer, profiler, op);
+                            }
+                        }
+
+                        if let Some(gauge) = otel_seqnum_gauge.as_mut() {
+                            if let Telemetry::NcclOpIssued(op) = &telemetry {
+                                let _ = otel_utils::record_ncclop_seqnum(gauge, profiler, op);
                             }
                         }
                     },
