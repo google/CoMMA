@@ -337,7 +337,8 @@ async fn build_bufwriter(
 async fn exporter(
     profiler: &'static Profiler,
     mut rx: mpsc::Receiver<Telemetry>,
-    otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
+    otel_send_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
+    otel_recv_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
 ) -> std::io::Result<()> {
     let mut latency_file = if let Some(template) = profiler.config.latency_file.as_ref() {
         let path = template.replace("%p", &format!("{}", profiler.pid));
@@ -377,6 +378,17 @@ async fn exporter(
     } else {
         None
     };
+
+    let mut otel_duration_histogram: Option<otel_utils::DurationHistogram> =
+        if profiler.config.otel_enable {
+            Some(otel_utils::DurationHistogram::new(
+                "nccl.collective.duration",
+                "ns",
+                profiler.config.otel_metrics_max_cardinality,
+            ))
+        } else {
+            None
+        };
 
     let mut summary_interval = tokio::time::interval(profiler.config.summary_interval);
 
@@ -449,6 +461,32 @@ async fn exporter(
                                 let _ = otel_utils::record_ncclop_seqnum(gauge, profiler, op);
                             }
                         }
+
+                        if let Some(histogram) = otel_duration_histogram.as_mut() {
+                            match &telemetry {
+                                Telemetry::NcclOp(op) => {
+                                    let _ = otel_utils::record_ncclop_duration(histogram, profiler, op);
+                                }
+                                Telemetry::CommClose(comm_hash) => {
+                                    histogram.close_comm(*comm_hash);
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if let Telemetry::CommClose(comm_hash) = &telemetry {
+                            for manager in [
+                                otel_send_latency_hist_manager.as_ref(),
+                                otel_recv_latency_hist_manager.as_ref(),
+                            ]
+                            .into_iter()
+                            .flatten()
+                            {
+                                if let Ok(mut inner) = manager.lock() {
+                                    inner.close_comm(*comm_hash);
+                                }
+                            }
+                        }
                     },
                     None => break,
                 }
@@ -470,10 +508,22 @@ async fn exporter(
                 }
             },
             _ = async { otel_metrics_grouping_interval.as_mut().unwrap().tick().await }, if otel_metrics_grouping_interval.is_some() => {
-                if let Some(manager) = otel_latency_hist_manager.as_ref() {
+                for manager in [
+                    otel_send_latency_hist_manager.as_ref(),
+                    otel_recv_latency_hist_manager.as_ref(),
+                ]
+                .into_iter()
+                .flatten()
+                {
                     if let Ok(mut inner) = manager.lock() {
                         inner.update_priority();
                     }
+                }
+                if let Some(histogram) = otel_duration_histogram.as_mut() {
+                    histogram.update_priority();
+                }
+                if let Some(gap_tracker) = profiler.gap_tracker.as_ref() {
+                    gap_tracker.check_stalled();
                 }
             },
         }
@@ -500,7 +550,8 @@ async fn exporter(
 
 struct Exporter {
     tx: mpsc::Sender<Telemetry>,
-    otel_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
+    otel_send_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
+    otel_recv_latency_hist_manager: Option<Arc<Mutex<otel_utils::HistogramManager>>>,
     gpuviz: Option<Mutex<gpuviz::HistogramManager<Arc<gpuviz::Connection>>>>,
     track_step_fifo_wait: bool,
 }
@@ -510,7 +561,8 @@ impl Exporter {
     fn new(tx: mpsc::Sender<Telemetry>) -> Self {
         Self {
             tx,
-            otel_latency_hist_manager: None,
+            otel_send_latency_hist_manager: None,
+            otel_recv_latency_hist_manager: None,
             gpuviz: None,
             track_step_fifo_wait: false,
         }
@@ -548,7 +600,12 @@ impl Export for Exporter {
         key: &NcclOpKey,
     ) -> Option<impl std::iter::IntoIterator<Item = Arc<dyn AtomicHistogram<EventStep>>>> {
         let mut histograms: Vec<Arc<dyn AtomicHistogram<EventStep>>> = Vec::new();
-        if let Some(manager) = self.otel_latency_hist_manager.as_ref() {
+        let otel_manager = match key {
+            NcclOpKey::NetSend(..) => self.otel_send_latency_hist_manager.as_ref(),
+            NcclOpKey::NetRecv(..) => self.otel_recv_latency_hist_manager.as_ref(),
+            _ => None,
+        };
+        if let Some(manager) = otel_manager {
             if let Ok(mut lg) = manager.lock() {
                 let h = Arc::new(lg.get_histogram(key.clone()));
                 histograms.push(h as _);
@@ -590,23 +647,35 @@ async fn main_loop(
         if otel_utils::init_tracer_provider(&profiler.config).is_none() {
             log::warn!("failed to init otel tracer provider");
         }
+        if let Some(gap_tracker) = profiler.gap_tracker.as_ref() {
+            gap_tracker.init_instrument();
+        }
     }
     const TELEMETRY_CHANNEL_SZ: usize = 4096;
     let (tx, rx) = mpsc::channel::<Telemetry>(TELEMETRY_CHANNEL_SZ);
-    let otel_latency_hist_manager = if profiler.config.otel_enable {
-        Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
-            "nccl.net_send.latency",
-            "ns",
-            profiler.config.otel_metrics_max_cardinality,
-        ))))
-    } else {
-        None
+    let new_latency_hist_manager = |name| {
+        if profiler.config.otel_enable {
+            Some(Arc::new(Mutex::new(otel_utils::HistogramManager::new(
+                name,
+                "ns",
+                profiler.config.otel_metrics_max_cardinality,
+            ))))
+        } else {
+            None
+        }
     };
-    let export_worker =
-        tokio::task::spawn(exporter(profiler, rx, otel_latency_hist_manager.clone()));
+    let otel_send_latency_hist_manager = new_latency_hist_manager("nccl.net_send.latency");
+    let otel_recv_latency_hist_manager = new_latency_hist_manager("nccl.net_recv.latency");
+    let export_worker = tokio::task::spawn(exporter(
+        profiler,
+        rx,
+        otel_send_latency_hist_manager.clone(),
+        otel_recv_latency_hist_manager.clone(),
+    ));
     let exporter = Exporter {
         tx,
-        otel_latency_hist_manager,
+        otel_send_latency_hist_manager,
+        otel_recv_latency_hist_manager,
         gpuviz: profiler
             .gpuviz_lib
             .as_ref()
@@ -660,6 +729,102 @@ mod tests {
 
     // create a mutex to avoid multiple test cases allocating ncclops concurrently
     static NCCLOP_TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    #[test]
+    fn otel_latency_histogram_routing() {
+        const MAX_CARDINALITY: usize = 4;
+        let (tx, _rx) = mpsc::channel::<Telemetry>(4);
+        let send_manager = Arc::new(Mutex::new(otel_utils::HistogramManager::new(
+            "nccl.net_send.latency",
+            "ns",
+            MAX_CARDINALITY,
+        )));
+        let recv_manager = Arc::new(Mutex::new(otel_utils::HistogramManager::new(
+            "nccl.net_recv.latency",
+            "ns",
+            MAX_CARDINALITY,
+        )));
+        let exporter = Exporter {
+            tx,
+            otel_send_latency_hist_manager: Some(send_manager.clone()),
+            otel_recv_latency_hist_manager: Some(recv_manager.clone()),
+            gpuviz: None,
+            track_step_fifo_wait: false,
+        };
+
+        assert!(exporter
+            .get_latency_histogram(&NcclOpKey::NetSend(0x123, 0, 1))
+            .is_some());
+        assert_eq!(send_manager.lock().unwrap().num_active(), 1);
+        assert_eq!(recv_manager.lock().unwrap().num_active(), 0);
+
+        assert!(exporter
+            .get_latency_histogram(&NcclOpKey::NetRecv(0x123, 0, 1))
+            .is_some());
+        assert_eq!(send_manager.lock().unwrap().num_active(), 1);
+        assert_eq!(recv_manager.lock().unwrap().num_active(), 1);
+    }
+
+    #[test]
+    fn otel_gap_spans_op_execution() {
+        use crate::event_ffi::AsFFI as _;
+        use crate::profiler::THREAD_STATE;
+
+        let _lg = NCCLOP_TEST_MUTEX.lock().unwrap();
+
+        let mut profiler = Profiler::new(Version::V2);
+        profiler.pid = 42; // must match the pid in the mock proxyop descriptor
+        profiler.config.track_interprocess_proxyop = false;
+        profiler.config.otel_enable = true;
+        profiler.gap_tracker = Some(otel_utils::GapTracker::new());
+
+        let profiler_ptr = Box::into_raw(Box::new(profiler));
+        // SAFETY: the box is only reclaimed after the daemon is joined and
+        // the thread state referencing it is dropped
+        let profiler: &'static Profiler = unsafe { &*profiler_ptr };
+        profiler.spawn_daemon();
+        THREAD_STATE.with_borrow_mut(|state| *state = Some(profiler.init_thread_state()));
+
+        {
+            let gap_tracker = profiler.gap_tracker.as_ref().unwrap();
+            let comm = Communicator::new();
+
+            let mut coll_descr = profiler_shim::tests::dummy_coll_descr();
+            // large enough to bypass the small-collective fast paths
+            coll_descr.0.__bindgen_anon_1.coll.count = 1 << 20;
+            let op = crate::profiler::start_event_handler(&coll_descr, &comm)
+                .unwrap()
+                .unwrap();
+            assert!(std::matches!(op, event::Event::NcclOp(_)));
+            assert_eq!(gap_tracker.in_flight(), 1);
+            let op_handle = op.into_ffi();
+
+            // the op's network work starts while it is being enqueued
+            let mut proxyop_descr = profiler_shim::tests::dummy_proxyop_descr();
+            proxyop_descr.0.parentObj = op_handle;
+            let proxyop = crate::profiler::start_event_handler(&proxyop_descr, &comm)
+                .unwrap()
+                .unwrap();
+            assert!(std::matches!(proxyop, event::Event::ProxyOp(_)));
+            assert_eq!(gap_tracker.in_flight(), 2);
+
+            // NCCL stops the op event once it is enqueued, but the op stays
+            // in flight until its proxy op completes
+            // SAFETY: op_handle is a valid handle returned by into_ffi()
+            let op = unsafe { event::Event::from_ffi(op_handle) }.unwrap();
+            crate::profiler::stop_event_handler(op).unwrap();
+            assert_eq!(gap_tracker.in_flight(), 1);
+
+            crate::profiler::stop_event_handler(proxyop).unwrap();
+            assert_eq!(gap_tracker.in_flight(), 0);
+        }
+
+        profiler.join_daemon();
+        THREAD_STATE.with_borrow_mut(|state| *state = None);
+        // SAFETY: reclaim the profiler leaked above; the daemon and thread
+        // state that referenced it are gone
+        let _ = unsafe { Box::from_raw(profiler_ptr) };
+    }
 
     #[test]
     fn e2e_mock() {

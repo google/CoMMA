@@ -23,6 +23,7 @@ use crate::gpuviz;
 use crate::nccl_metadata;
 use crate::nccl_metadata::ProxyOp;
 use crate::nccl_metadata::{Coll as _, Event as _, NcclOp as _, P2p as _, ProxyStep as _};
+use crate::otel_utils;
 use crate::profiler_shim;
 use crate::slab;
 use crate::spsc;
@@ -61,6 +62,7 @@ pub struct Profiler {
     daemon: Mutex<Option<cloud_daemon::CloudDaemon>>,
 
     ncclop_cnt: AtomicU64,
+    pub gap_tracker: Option<otel_utils::GapTracker>,
     pub remote_net_bytes: Option<Arc<AtomicUsize>>,
     pub free_ncclop: slab::AtomicFreeList<event::NcclOp>,
     pub free_proxyop: slab::AtomicFreeList<event::ProxyOp>,
@@ -102,6 +104,11 @@ impl Profiler {
             daemon: Mutex::new(None),
 
             ncclop_cnt: AtomicU64::new(0),
+            gap_tracker: if config.otel_enable {
+                Some(otel_utils::GapTracker::new())
+            } else {
+                None
+            },
             remote_net_bytes: if config.heartbeat_collective_progress {
                 Some(Arc::new(AtomicUsize::new(0)))
             } else {
@@ -742,89 +749,122 @@ where
         }
         _ => panic!("unknown event type"),
     };
+    if event.as_ref().is_some_and(is_nccl_activity) {
+        with_thread_state(|thread_state| {
+            let profiler = thread_state.profiler;
+            if let Some(gap_tracker) = profiler.gap_tracker.as_ref() {
+                gap_tracker.activity_begin(|| profiler.recent_timer_ns());
+            }
+        });
+    }
     Ok(event)
 }
 
+// events that represent NCCL activity for gap tracking: an op being enqueued
+// or its network / kernel work in progress; the proxy op and kernel channel
+// windows keep an op in flight until its work actually completes, well after
+// NCCL stops the op event itself at enqueue time
+fn is_nccl_activity(event: &event::Event) -> bool {
+    std::matches!(
+        event,
+        event::Event::NcclOp(_)
+            | event::Event::NcclOpLite(_)
+            | event::Event::SmallNcclOp(_)
+            | event::Event::ProxyOp(_)
+            | event::Event::ProxyOpLite(_)
+            | event::Event::KernelCh(_)
+    )
+}
+
 pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
-    with_thread_state(|thread_state| match event {
-        event::Event::Group(group) => {
-            thread_state.send_to_daemon(daemon::Message::Group(group), true);
-        }
-        event::Event::ProxyOpLite(data) => {
-            thread_state.fifo.prefetch_next();
-            if let Some(ncclop) = data.parent_op {
-                if let Some(start_time) = thread_state.dec_ncclop_ref(data.info.pid, ncclop) {
-                    let msg = daemon::Message::ProxyOpLite(
-                        start_time,
-                        start_time.elapsed().as_nanos() as u64,
-                        data.info.clone(),
-                    );
+    let end_nccl_activity = is_nccl_activity(&event);
+    with_thread_state(|thread_state| {
+        match event {
+            event::Event::Group(group) => {
+                thread_state.send_to_daemon(daemon::Message::Group(group), true);
+            }
+            event::Event::ProxyOpLite(data) => {
+                thread_state.fifo.prefetch_next();
+                if let Some(ncclop) = data.parent_op {
+                    if let Some(start_time) = thread_state.dec_ncclop_ref(data.info.pid, ncclop) {
+                        let msg = daemon::Message::ProxyOpLite(
+                            start_time,
+                            start_time.elapsed().as_nanos() as u64,
+                            data.info.clone(),
+                        );
+                        thread_state.send_to_daemon(msg, true);
+                    }
+                }
+                thread_state.proxyop_free_list.free(data);
+            }
+            event::Event::ProxyOp(mut data) => {
+                thread_state.fifo.prefetch_next();
+                if let Some(step) = data.step_tracker.finalize() {
+                    data.get_steps_mut(thread_state).push(step);
+                }
+                if thread_state.profiler.config.track_proxyop {
+                    // if we are tracking proxyop also send the extra info about this proxyop
+                    let msg = daemon::Message::ProxyOpExtra(data.extra.clone());
+                    thread_state.send_to_daemon(msg, false);
+                }
+                if let Some(steps) = data.steps.take() {
+                    let msg = daemon::Message::StepBatch(data.info.clone(), steps, true);
+                    thread_state.send_to_daemon(msg, true);
+                } else {
+                    let msg = daemon::Message::ProxyOp(data.info.id);
                     thread_state.send_to_daemon(msg, true);
                 }
+                thread_state.proxyop_free_list.free(data);
             }
-            thread_state.proxyop_free_list.free(data);
-        }
-        event::Event::ProxyOp(mut data) => {
-            thread_state.fifo.prefetch_next();
-            if let Some(step) = data.step_tracker.finalize() {
-                data.get_steps_mut(thread_state).push(step);
-            }
-            if thread_state.profiler.config.track_proxyop {
-                // if we are tracking proxyop also send the extra info about this proxyop
-                let msg = daemon::Message::ProxyOpExtra(data.extra.clone());
-                thread_state.send_to_daemon(msg, false);
-            }
-            if let Some(steps) = data.steps.take() {
-                let msg = daemon::Message::StepBatch(data.info.clone(), steps, true);
-                thread_state.send_to_daemon(msg, true);
-            } else {
-                let msg = daemon::Message::ProxyOp(data.info.id);
-                thread_state.send_to_daemon(msg, true);
-            }
-            thread_state.proxyop_free_list.free(data);
-        }
-        event::Event::ProxyStep(mut data) => {
-            if data.end_time.is_none() {
-                data.end_time = Some(thread_state.profiler.recent_timer_instant());
-            }
-            let step =
-                data.finalize(|t| (*t - thread_state.profiler.init_instant).as_nanos() as u64);
-            // SAFETY: NCCL guarantees that the proxyop event handle is
-            // live at this moment and the proxystep is on the same thread
-            // as the parent event handle.
-            // Therefore, dereference this pointer is safe as
-            // 1. the pointer is valid
-            // 2. there is no other threads accessing it
-            let parent = unsafe { &mut *data.parent };
-            let steps = parent.get_steps_mut(thread_state);
-            steps.push(step);
-            if steps.is_full() {
-                let steps = parent.steps.take().unwrap();
-                let msg = daemon::Message::StepBatch(parent.info.clone(), steps, false);
-                thread_state.send_to_daemon(msg, false);
-            }
-            thread_state.proxystep_free_list.free(data);
-        }
-        event::Event::KernelCh(kernelch) => {
-            thread_state.fifo.prefetch_next();
-            if let Some(ncclop) = kernelch.parent_op {
-                if let Some(start_time) =
-                    thread_state.dec_ncclop_ref(thread_state.profiler.pid, ncclop)
-                {
-                    let msg = daemon::Message::KernelCh(
-                        start_time,
-                        start_time.elapsed().as_nanos() as u64,
-                        ncclop,
-                    );
-                    thread_state.send_to_daemon(msg, true);
+            event::Event::ProxyStep(mut data) => {
+                if data.end_time.is_none() {
+                    data.end_time = Some(thread_state.profiler.recent_timer_instant());
                 }
+                let step =
+                    data.finalize(|t| (*t - thread_state.profiler.init_instant).as_nanos() as u64);
+                // SAFETY: NCCL guarantees that the proxyop event handle is
+                // live at this moment and the proxystep is on the same thread
+                // as the parent event handle.
+                // Therefore, dereference this pointer is safe as
+                // 1. the pointer is valid
+                // 2. there is no other threads accessing it
+                let parent = unsafe { &mut *data.parent };
+                let steps = parent.get_steps_mut(thread_state);
+                steps.push(step);
+                if steps.is_full() {
+                    let steps = parent.steps.take().unwrap();
+                    let msg = daemon::Message::StepBatch(parent.info.clone(), steps, false);
+                    thread_state.send_to_daemon(msg, false);
+                }
+                thread_state.proxystep_free_list.free(data);
             }
-            thread_state.kernelch_free_list.free(kernelch);
+            event::Event::KernelCh(kernelch) => {
+                thread_state.fifo.prefetch_next();
+                if let Some(ncclop) = kernelch.parent_op {
+                    if let Some(start_time) =
+                        thread_state.dec_ncclop_ref(thread_state.profiler.pid, ncclop)
+                    {
+                        let msg = daemon::Message::KernelCh(
+                            start_time,
+                            start_time.elapsed().as_nanos() as u64,
+                            ncclop,
+                        );
+                        thread_state.send_to_daemon(msg, true);
+                    }
+                }
+                thread_state.kernelch_free_list.free(kernelch);
+            }
+            event::Event::Dummy(_) => (),
+            event::Event::SmallNcclOp(_) => (),
+            event::Event::NcclOpLite(_) => {}
+            event::Event::NcclOp(_) => {}
         }
-        event::Event::Dummy(_) => (),
-        event::Event::SmallNcclOp(_) => (),
-        event::Event::NcclOpLite(_) => {}
-        event::Event::NcclOp(_) => {}
+        if end_nccl_activity {
+            let profiler = thread_state.profiler;
+            if let Some(gap_tracker) = profiler.gap_tracker.as_ref() {
+                gap_tracker.activity_end(profiler.recent_timer_ns());
+            }
+        }
     });
     Ok(())
 }

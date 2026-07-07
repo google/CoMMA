@@ -58,14 +58,16 @@ impl EventStepInProgress {
     }
 
     fn finalize(&self) -> EventStep {
-        let fifo_wait_dur_ns = self.fifo_ready_time.map(|t| (t - self.start_time) as u32);
+        let fifo_wait_dur_ns = self
+            .fifo_ready_time
+            .map(|t| u32::try_from(t - self.start_time).unwrap_or(u32::MAX));
         let net_start_time = self.fifo_ready_time.unwrap_or(self.start_time);
         EventStep {
             step: self.step,
             size: self.size.unwrap(),
             start_time: self.start_time,
             fifo_wait_dur_ns,
-            dur_ns: (self.end_time.unwrap() - net_start_time) as _,
+            dur_ns: u32::try_from(self.end_time.unwrap() - net_start_time).unwrap_or(u32::MAX),
         }
     }
 }
@@ -298,5 +300,36 @@ mod tests {
             assert_eq!(step.step, i as i32);
             assert_eq!(step.size, SZ);
         }
+    }
+
+    #[test]
+    fn steptracker_saturates_dur_over_u32_max() {
+        const SZ: usize = 65536;
+        let mut tracker = StepTracker::new(true, true, false);
+
+        let clock = std::cell::Cell::new(0u64);
+        let get_time = || -> u64 {
+            let t = clock.get();
+            clock.set(t + 6_000_000_000); // 6 s between events, > u32::MAX ns
+            t
+        };
+
+        let args = nccl_metadata::ProxyOpStateV1::new(0, 0);
+        let first = tracker.update_step(
+            profiler_shim::proxy_event_state::v1::SEND_TRANSMITTED,
+            &args,
+            get_time,
+        );
+        assert!(first.is_none());
+
+        let args = nccl_metadata::ProxyOpStateV1::new(0, SZ);
+        let _ = tracker.update_step(
+            profiler_shim::proxy_event_state::v1::SEND_DONE,
+            &args,
+            get_time,
+        );
+
+        let step = tracker.finalize().expect("expected a finalized step");
+        assert_eq!(step.dur_ns, u32::MAX);
     }
 }

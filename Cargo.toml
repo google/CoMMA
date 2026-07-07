@@ -20,6 +20,12 @@ path = "src/integration_benchmark.rs"
 name = "clock"
 harness = false
 
+# copybara:strip_begin(otel)
+[[bench]]
+name = "otel_utils"
+harness = false
+# copybara:strip_end
+
 [features]
 default = []
 explicit-optin = []
