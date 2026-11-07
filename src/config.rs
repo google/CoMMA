@@ -72,12 +72,14 @@ pub struct Config {
     pub track_step_fifo_wait: bool,
     pub aggregate_steps: bool,
     pub track_kernel_ch: bool,
+    pub track_kernel_phase: bool,
     pub ncclop_completion_delay: Duration,
     pub comm_hash_ipc_timeout: Duration,
 
     // Performance related
     pub fifo_batch_size: usize,
     pub ncclop_timeout: Duration,
+    pub ncclop_reclaim_interval: Duration,
     pub max_tracked_ncclop: usize,
     pub small_msg_threshold: usize,
     pub skip_nvls: bool,
@@ -126,11 +128,13 @@ impl Config {
         field_from_env!(s, track_step_fifo_wait, true);
         field_from_env!(s, aggregate_steps, true);
         field_from_env!(s, track_kernel_ch, false);
+        field_from_env!(s, track_kernel_phase, false);
         field_from_env!(s, ncclop_completion_delay, Duration::from_secs(2));
         field_from_env!(s, comm_hash_ipc_timeout, Duration::from_secs(1));
 
         field_from_env!(s, fifo_batch_size, 1024);
         field_from_env!(s, ncclop_timeout, Duration::from_secs(10));
+        field_from_env!(s, ncclop_reclaim_interval, Duration::from_millis(50));
         field_from_env!(s, max_tracked_ncclop, 65536);
         field_from_env!(s, small_msg_threshold, 65536);
         field_from_env!(s, skip_nvls, true);

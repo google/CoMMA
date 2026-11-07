@@ -17,7 +17,6 @@ use crate::event_ffi;
 use crate::nccl_metadata;
 use crate::nccl_metadata::NcclOpKey;
 use crate::profiler;
-use crate::profiler::Communicator;
 use crate::profiler_shim;
 use crate::slab;
 use crate::step_tracker::EventStep;
@@ -34,6 +33,7 @@ pub enum Event {
     NcclOp(usize),
     ProxyOpLite(slab::AllocatedNode<profiler::ProxyOpLocalData>), // Lite == no step tracking
     KernelCh(slab::AllocatedNode<profiler::KernelCh>),
+    KernelPhase(usize),
     ProxyOp(slab::AllocatedNode<profiler::ProxyOpLocalData>),
     Dummy(usize),
     SmallNcclOp(usize),
@@ -132,6 +132,7 @@ pub struct NcclOp {
     comm_hash: Option<u64>, // starting from v4 comm_hash is no longer part of the event descriptor
     descr: nccl_metadata::EventMetadata,
     proxyops: Option<Vec<ProxyOp>>,
+    kernel_chs: Option<Vec<profiler::KernelChInfo>>,
 }
 
 #[derive(Debug, Clone)]
@@ -142,11 +143,15 @@ pub struct ProxyOpInfo {
     pub id: u32,
     pub peer: u32,
     pub is_send: bool,
-    pub comm: Option<Communicator>,
+    /// Comm hash of the communicator that issued this proxyop. Only available for
+    /// non-PXN proxyops (i.e. proxyop pid matches the profiler pid). Used as a fallback to
+    /// resolve the comm hash when the parent ncclop is no longer tracked by the daemon
+    /// (e.g. it was reclaimed due to timeout before the proxyop arrived).
+    pub comm_hash: Option<u64>,
 }
 
 impl ProxyOpInfo {
-    pub fn from_descr<E>(descr: &E, id: u32, comm: Option<Communicator>) -> Self
+    pub fn from_descr<E>(descr: &E, id: u32, comm_hash: Option<u64>) -> Self
     where
         E: nccl_metadata::ProxyOp,
     {
@@ -157,7 +162,7 @@ impl ProxyOpInfo {
             id,
             peer: descr.peer() as _,
             is_send: descr.is_send(),
-            comm,
+            comm_hash,
         }
     }
 
@@ -252,7 +257,7 @@ impl NcclOp {
     where
         E: nccl_metadata::Event,
     {
-        let is_p2p = match descr.type_() as u32 {
+        let is_p2p = match descr.type_() {
             profiler_shim::ncclProfileColl => false,
             profiler_shim::ncclProfileP2p => true,
             _ => panic!("Unknown ncclop type"),
@@ -265,6 +270,7 @@ impl NcclOp {
             comm_hash: comm_hash_override,
             descr: descr.clone_to_metadata(),
             proxyops: None,
+            kernel_chs: None,
         }
     }
 
@@ -330,6 +336,13 @@ impl NcclOp {
         }
         self.proxyops.as_mut().unwrap().push(proxyop);
     }
+
+    pub fn add_kernel_ch(&mut self, info: profiler::KernelChInfo) {
+        if self.kernel_chs.is_none() {
+            self.kernel_chs = Some(Vec::new());
+        }
+        self.kernel_chs.as_mut().unwrap().push(info);
+    }
 }
 
 impl ProfilerEvent for NcclOp {
@@ -380,6 +393,42 @@ impl ProfilerEvent for NcclOp {
                 .collect();
         }
 
+        if let Some(kernel_chs) = self.kernel_chs.as_ref() {
+            // Note: NCCL's GPU kernel timer (pTimer) is sourced from CUDA PTX %globaltimer,
+            // which increments at 1 GHz (nanoseconds). We convert these timestamps and durations
+            // to microseconds (/ 1000) to align with the rest of the trace record (ts, dur).
+            let ch_records: Vec<serde_json::Value> = kernel_chs
+                .iter()
+                .map(|ch| {
+                    let mut record = json!({
+                        "channel_id": ch.channel_id,
+                        "start_timer": ch.start_timer / 1000,
+                        "stop_timer": ch.stop_timer / 1000,
+                        "dur": ch.stop_timer.saturating_sub(ch.start_timer) / 1000,
+                    });
+                    let has_phases = ch
+                        .phases
+                        .iter()
+                        .any(|p| p.start_timer != 0 || p.stop_timer != 0);
+                    if has_phases {
+                        record["phases"] = json!({
+                            "initial_sync_dur": ch.phases[0].stop_timer.saturating_sub(ch.phases[0].start_timer) / 1000,
+                            "compute_dur": ch.phases[1].stop_timer.saturating_sub(ch.phases[1].start_timer) / 1000,
+                            "final_sync_dur": ch.phases[2].stop_timer.saturating_sub(ch.phases[2].start_timer) / 1000,
+                            "initial_sync_start": ch.phases[0].start_timer / 1000,
+                            "initial_sync_stop": ch.phases[0].stop_timer / 1000,
+                            "compute_start": ch.phases[1].start_timer / 1000,
+                            "compute_stop": ch.phases[1].stop_timer / 1000,
+                            "final_sync_start": ch.phases[2].start_timer / 1000,
+                            "final_sync_stop": ch.phases[2].stop_timer / 1000,
+                        });
+                    }
+                    record
+                })
+                .collect();
+            json["kernel_chs"] = json!(ch_records);
+        }
+
         if let Some(child_start_time) = self.child_start_time {
             json["child_start_ts"] = json!(time_to_num(child_start_time));
             if !is_reclaimed {
@@ -404,7 +453,7 @@ impl ProxyOp {
         let basic_info = BasicInfo::from_descr(descr, time);
         Self {
             basic_info,
-            info: ProxyOpInfo::from_descr(descr, 0, Some(profiler::Communicator::new())),
+            info: ProxyOpInfo::from_descr(descr, 0, /* comm_hash = */ None),
             extra: Some(ProxyOpExtra::from_descr(descr)),
             tracking_time: true,
             step_histograms: Vec::new(),
@@ -533,6 +582,10 @@ impl ProfilerEvent for ProxyOp {
             "is_send": self.info.is_send,
         });
 
+        if let Some(comm_hash) = self.info.comm_hash {
+            json["comm_hash"] = json!(format!("0x{:016x}", comm_hash));
+        }
+
         if let Some(extra) = self.extra.as_ref() {
             json["n_steps"] = json!(extra.n_steps);
             json["chunk_size"] = json!(extra.chunk_size);
@@ -632,5 +685,66 @@ mod tests {
         basic_info.update_end_time(t1);
         basic_info.update_end_time(t0);
         assert_eq!(basic_info.end_time(), Some(t1));
+    }
+
+    #[test]
+    fn ncclop_trace_record_kernel_chs() {
+        let coll_descr = crate::profiler_shim::tests::dummy_coll_descr();
+        let mut ncclop = NcclOp::from_descr(
+            &coll_descr,
+            Instant::now(),
+            /* id = */ 0,
+            /* comm_hash_override = */ None,
+        );
+        let info = profiler::KernelChInfo {
+            channel_id: 1,
+            start_timer: 1_000_000,
+            stop_timer: 3_500_000,
+            phases: [
+                profiler::PhaseTimestamps {
+                    start_timer: 1_000_000,
+                    stop_timer: 1_200_000,
+                },
+                profiler::PhaseTimestamps {
+                    start_timer: 1_200_000,
+                    stop_timer: 3_000_000,
+                },
+                profiler::PhaseTimestamps {
+                    start_timer: 3_000_000,
+                    stop_timer: 3_500_000,
+                },
+            ],
+        };
+        let info2 = profiler::KernelChInfo {
+            channel_id: 8,
+            start_timer: 1_050_000,
+            stop_timer: 3_600_000,
+            phases: [profiler::PhaseTimestamps::default(); profiler::MAX_KERNEL_PHASES],
+        };
+        ncclop.add_kernel_ch(info);
+        ncclop.add_kernel_ch(info2);
+        let record = ncclop.trace_record(|_| 0);
+        assert!(record.get("kernel_chs").is_some());
+        let kchs = record["kernel_chs"].as_array().unwrap();
+        assert_eq!(kchs.len(), 2);
+        let kch = &kchs[0];
+        assert_eq!(kch["channel_id"], 1);
+        assert_eq!(kch["start_timer"], 1000);
+        assert_eq!(kch["stop_timer"], 3500);
+        assert_eq!(kch["dur"], 2500);
+        assert_eq!(kch["phases"]["initial_sync_dur"], 200);
+        assert_eq!(kch["phases"]["compute_dur"], 1800);
+        assert_eq!(kch["phases"]["final_sync_dur"], 500);
+        assert_eq!(kch["phases"]["initial_sync_start"], 1000);
+        assert_eq!(kch["phases"]["initial_sync_stop"], 1200);
+        assert_eq!(kch["phases"]["compute_start"], 1200);
+        assert_eq!(kch["phases"]["compute_stop"], 3000);
+        assert_eq!(kch["phases"]["final_sync_start"], 3000);
+        assert_eq!(kch["phases"]["final_sync_stop"], 3500);
+        let kch2 = &kchs[1];
+        assert_eq!(kch2["channel_id"], 8);
+        assert_eq!(kch2["start_timer"], 1050);
+        assert_eq!(kch2["stop_timer"], 3600);
+        assert_eq!(kch2["dur"], 2550);
     }
 }

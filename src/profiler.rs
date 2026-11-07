@@ -19,10 +19,13 @@ use crate::daemon;
 use crate::event;
 use crate::event_ffi;
 use crate::event_ffi::AsFFI as _;
+use crate::gpu;
 use crate::gpuviz;
 use crate::nccl_metadata;
-use crate::nccl_metadata::ProxyOp;
-use crate::nccl_metadata::{Coll as _, Event as _, NcclOp as _, P2p as _, ProxyStep as _};
+use crate::nccl_metadata::{
+    Coll as _, Event as _, KernelCh as _, KernelPhase as _, NcclOp as _, P2p as _, ProxyOp as _,
+    ProxyStep as _,
+};
 use crate::profiler_shim;
 use crate::slab;
 use crate::spsc;
@@ -46,6 +49,7 @@ pub enum Version {
     V2,
     V3,
     V4,
+    V7,
 }
 
 /// struct that holds global states for profiler
@@ -76,6 +80,7 @@ impl Profiler {
         let config = &*config::CONFIG;
         let init_time = SystemTime::now();
         let init_instant = Instant::now();
+
         Self {
             config: config.clone(),
             version,
@@ -174,7 +179,7 @@ pub fn thread_local_state(profiler: &'_ Profiler) -> (ThreadLocalState<'_>, daem
     ncclop_tx.set_batch(std::cmp::max(1, profiler.config.fifo_batch_size));
     fifo_tx.set_batch(std::cmp::max(1, profiler.config.fifo_batch_size));
 
-    let n_free_proxystep = if profiler.version == Version::V4 {
+    let n_free_proxystep = if matches!(profiler.version, Version::V4 | Version::V7) {
         slab::FREELIST_BATCH
     } else {
         0
@@ -330,21 +335,54 @@ impl ThreadLocalState<'_> {
 pub struct Communicator {
     pub comm_hash: Option<u64>,
     pub total_net_bytes: Arc<AtomicUsize>,
+    pub gpu_info: Option<gpu::GpuDeviceMetadata>,
+    pub rank: Option<usize>,
 }
 
 impl Communicator {
-    pub fn new() -> Self {
+    pub fn new(gpu_info: Option<gpu::GpuDeviceMetadata>) -> Self {
+        if let Some(ref gpu) = gpu_info {
+            log::info!(
+                "CoMMA: Communicator bound to active GPU: UUID={}, PCIe={}",
+                gpu.uuid,
+                gpu.pcie_address
+            );
+        } else {
+            log::info!(
+                "CoMMA: No active GPU detected for this communicator or NVML/CUDA not available."
+            );
+        }
+
         Self {
             comm_hash: None,
             total_net_bytes: Arc::new(AtomicUsize::new(0)),
+            gpu_info,
+            rank: None,
         }
     }
 }
 
-#[derive(Debug)]
-#[repr(align(16))]
+pub const MAX_KERNEL_PHASES: usize = 3;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PhaseTimestamps {
+    pub start_timer: u64,
+    pub stop_timer: u64,
+}
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct KernelChInfo {
+    pub channel_id: u8,
+    pub start_timer: u64,
+    pub stop_timer: u64,
+    pub phases: [PhaseTimestamps; MAX_KERNEL_PHASES],
+}
+
+#[derive(Debug, Default)]
+#[repr(align(64))]
 pub struct KernelCh {
     pub parent_op: Option<usize>,
+    pub info: KernelChInfo,
 }
 
 #[derive(Debug)]
@@ -357,6 +395,9 @@ pub struct ProxyOpLocalData {
     pub parent_op: Option<usize>,
     pub steps: Option<slab::AllocatedNode<daemon::StepBatch>>,
     pub rng_seed: u32,
+    /// Per-communicator net bytes counter used by heartbeat_collective_progress. Only set for
+    /// non-PXN proxyops when heartbeat_collective_progress is enabled.
+    pub net_bytes: Option<Arc<AtomicUsize>>,
 }
 
 impl ProxyOpLocalData {
@@ -365,12 +406,13 @@ impl ProxyOpLocalData {
         descr: &E,
         is_v1: bool,
         track_fifo_wait: bool,
-        comm: Option<Communicator>,
+        comm_hash: Option<u64>,
+        net_bytes: Option<Arc<AtomicUsize>>,
     ) -> Self
     where
         E: nccl_metadata::ProxyOp,
     {
-        let info = event::ProxyOpInfo::from_descr(descr, id, comm);
+        let info = event::ProxyOpInfo::from_descr(descr, id, comm_hash);
         let is_send = info.is_send;
         Self {
             info,
@@ -380,6 +422,7 @@ impl ProxyOpLocalData {
             parent_op: None,
             steps: None,
             rng_seed: 0,
+            net_bytes,
         }
     }
 
@@ -416,6 +459,7 @@ pub fn init_handler(
     version: Version,
 ) -> NcclResult<Box<Communicator>> {
     let mut mask = 0;
+    let mut gpu_info = None;
     if config::CONFIG.telemetry_mode > 0 {
         let mut lg = INIT_FLAG.lock().unwrap();
         if *lg == 0 {
@@ -436,9 +480,17 @@ pub fn init_handler(
         if config::CONFIG.track_kernel_ch {
             mask |= profiler_shim::ncclProfileKernelCh;
         }
+        if config::CONFIG.track_kernel_phase {
+            mask |= profiler_shim::ncclProfileKernelPhase;
+            mask |= profiler_shim::ncclProfileKernelCh;
+        }
+
+        gpu_info = gpu::get_active_gpu_metadata()
+            .map_err(|e| log::debug!("Failed to query active GPU for communicator: {}", e))
+            .ok();
     }
     *e_activation_mask = mask as i32;
-    Ok(Box::new(Communicator::new()))
+    Ok(Box::new(Communicator::new(gpu_info)))
 }
 
 pub fn init_handler_v4(
@@ -447,10 +499,11 @@ pub fn init_handler_v4(
     comm_hash: u64,
     _n_nodes: i32,
     _n_ranks: i32,
-    _rank: i32,
+    rank: i32,
     version: Version,
 ) -> NcclResult<Box<Communicator>> {
     let mut mask = 0;
+    let mut gpu_info = None;
     if config::CONFIG.telemetry_mode > 0 {
         let mut lg = INIT_FLAG.lock().unwrap();
         if *lg == 0 {
@@ -470,14 +523,24 @@ pub fn init_handler_v4(
             mask |= profiler_shim::ncclProfileKernelCh;
         }
 
+        if config::CONFIG.track_kernel_phase {
+            mask |= profiler_shim::ncclProfileKernelPhase;
+            mask |= profiler_shim::ncclProfileKernelCh;
+        }
+
         if config::CONFIG.track_steps | config::CONFIG.aggregate_steps {
             mask |= profiler_shim::ncclProfileProxyStep;
         }
+
+        gpu_info = gpu::get_active_gpu_metadata()
+            .map_err(|e| log::debug!("Failed to query active GPU for communicator: {}", e))
+            .ok();
     }
     *e_activation_mask = mask as i32;
-    let mut comm = Box::new(Communicator::new());
+    let mut comm = Box::new(Communicator::new(gpu_info));
     comm.comm_hash = Some(comm_hash);
-    if config::CONFIG.heartbeat_collective_progress {
+    comm.rank = Some(rank as usize);
+    if config::CONFIG.telemetry_mode > 0 {
         with_thread_state(|thread_state| {
             thread_state.send_to_daemon(daemon::Message::CommOpen(*comm.clone()), true)
         });
@@ -493,7 +556,7 @@ where
     E: nccl_metadata::Version + nccl_metadata::Event,
 {
     let config: &config::Config = &config::CONFIG;
-    let event = match descr.type_() as u32 {
+    let event = match descr.type_() {
         profiler_shim::ncclProfileGroup => {
             if config.track_ncclop {
                 Some(event::Event::new_group(descr, Instant::now()))
@@ -637,19 +700,26 @@ where
                 with_thread_state(|thread_state| {
                     let profiler = thread_state.profiler;
                     let proxyop_id = thread_state.next_proxyop_id();
-                    let comm: Option<Communicator> =
-                        // SAFETY: comm is valid when pids match
-                        if config.heartbeat_collective_progress && profiler.pid == descr.pid() {
-                            unsafe { Some((*comm).clone()) }
-                        } else {
-                            None
-                        };
+                    let is_local = profiler.pid == descr.pid();
+                    let local_comm = if is_local {
+                        // SAFETY: comm is either null or valid when pids match
+                        unsafe { comm.as_ref() }
+                    } else {
+                        None
+                    };
+                    let comm_hash = local_comm.and_then(|c| c.comm_hash);
+                    let net_bytes = if config.heartbeat_collective_progress {
+                        local_comm.map(|c| c.total_net_bytes.clone())
+                    } else {
+                        None
+                    };
                     let mut local_data = ProxyOpLocalData::new(
                         proxyop_id,
                         descr,
                         E::version() == Version::V1,
                         profiler.config.track_step_fifo_wait,
-                        comm,
+                        comm_hash,
+                        net_bytes,
                     );
                     let is_send = local_data.info.is_send;
                     let mut skip_step_tracking = parent_type == event_ffi::Type::NcclOpLite;
@@ -689,13 +759,20 @@ where
             } else {
                 let parent = event_ffi::ProxyParent::from_ffi(parent_ffi);
                 if let event_ffi::ProxyParent::NcclOp(ncclop) = parent {
+                    // SAFETY: just checked that event type is kernelch
+                    let descr_kernelch = unsafe { descr.cast_to_kernelch() };
                     with_thread_state(|thread_state| {
-                        thread_state.inc_ncclop_ref(thread_state.profiler.pid, ncclop);
                         let kernelch = thread_state
                             .kernelch_free_list
                             .alloc_new(
                                 KernelCh {
                                     parent_op: Some(ncclop),
+                                    info: KernelChInfo {
+                                        channel_id: descr_kernelch.channel_id(),
+                                        start_timer: descr_kernelch.start_timer(),
+                                        stop_timer: 0,
+                                        phases: [PhaseTimestamps::default(); MAX_KERNEL_PHASES],
+                                    },
                                 },
                                 None,
                                 true,
@@ -705,6 +782,31 @@ where
                     })
                 } else {
                     None
+                }
+            }
+        }
+        profiler_shim::ncclProfileKernelPhase => {
+            let parent_ffi = descr.parent_obj();
+            let parent_type = event_ffi::get_handle_type(parent_ffi);
+            if parent_ffi.is_null() || parent_type != event_ffi::Type::KernelCh {
+                None
+            } else {
+                // SAFETY: just checked that event type is kernelphase
+                let descr_phase = unsafe { descr.cast_to_kernelphase() };
+                let phase_id = descr_phase.phase_id();
+                if (phase_id as usize) >= MAX_KERNEL_PHASES {
+                    None
+                } else {
+                    let kernelch_ptr = event_ffi::get_handle_inner(parent_ffi);
+                    let handle = event_ffi::make_kernel_phase_handle(kernelch_ptr, phase_id);
+                    // SAFETY: parent_ffi was verified as KernelCh handle on the current thread
+                    if let Some((kernelch, _)) =
+                        unsafe { event_ffi::parse_kernel_phase_event(handle as usize) }
+                    {
+                        kernelch.info.phases[phase_id as usize].start_timer =
+                            descr_phase.start_timer();
+                    }
+                    Some(event::Event::KernelPhase(handle as usize))
                 }
             }
         }
@@ -740,7 +842,7 @@ where
                 }
             }
         }
-        _ => panic!("unknown event type"),
+        _ => None,
     };
     Ok(event)
 }
@@ -808,19 +910,13 @@ pub fn stop_event_handler(event: event::Event) -> NcclResult<()> {
         event::Event::KernelCh(kernelch) => {
             thread_state.fifo.prefetch_next();
             if let Some(ncclop) = kernelch.parent_op {
-                if let Some(start_time) =
-                    thread_state.dec_ncclop_ref(thread_state.profiler.pid, ncclop)
-                {
-                    let msg = daemon::Message::KernelCh(
-                        start_time,
-                        start_time.elapsed().as_nanos() as u64,
-                        ncclop,
-                    );
-                    thread_state.send_to_daemon(msg, true);
-                }
+                let now = thread_state.profiler.recent_timer_instant();
+                let msg = daemon::Message::KernelCh(now, ncclop, kernelch.info);
+                thread_state.send_to_daemon(msg, true);
             }
             thread_state.kernelch_free_list.free(kernelch);
         }
+        event::Event::KernelPhase(_) => (),
         event::Event::Dummy(_) => (),
         event::Event::SmallNcclOp(_) => (),
         event::Event::NcclOpLite(_) => {}
@@ -887,8 +983,8 @@ where
                     // live at this moment and the proxystep is on the same thread
                     // as the parent event handle.
                     let parent = unsafe { &*data.parent };
-                    if let Some(ref comm) = parent.info.comm {
-                        comm.total_net_bytes.fetch_add(data.size, Ordering::Release);
+                    if let Some(ref net_bytes) = parent.net_bytes {
+                        net_bytes.fetch_add(data.size, Ordering::Release);
                     } else {
                         remote_net_bytes.fetch_add(data.size, Ordering::Release);
                     }
@@ -920,6 +1016,38 @@ pub fn record_proxyop_event_state_handler_v4(
                 thread_state.update_ncclop_start_time(data.info.pid, ncclop);
             }
         });
+    }
+    Ok(())
+}
+
+pub fn record_kernelch_event_state_handler<S>(
+    event: &mut event::Event,
+    _e_state: profiler_shim::ncclProfilerEventState_v1_t,
+    e_state_args: &S,
+) -> NcclResult<()>
+where
+    S: nccl_metadata::KernelTimerState,
+{
+    if let event::Event::KernelCh(kernelch) = event {
+        kernelch.info.stop_timer = e_state_args.stop_timer();
+    }
+    Ok(())
+}
+
+pub fn record_kernelphase_event_state_handler<S>(
+    event: &mut event::Event,
+    _e_state: profiler_shim::ncclProfilerEventState_v7_t,
+    e_state_args: &S,
+) -> NcclResult<()>
+where
+    S: nccl_metadata::KernelTimerState,
+{
+    if let event::Event::KernelPhase(handle) = event {
+        // SAFETY: `handle` comes from `from_ffi(e_handle)` for a valid KernelPhase event on the current thread
+        if let Some((kernelch, phase_id)) = unsafe { event_ffi::parse_kernel_phase_event(*handle) }
+        {
+            kernelch.info.phases[phase_id as usize].stop_timer = e_state_args.stop_timer();
+        }
     }
     Ok(())
 }

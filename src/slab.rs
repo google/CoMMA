@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub const FREELIST_BATCH: usize = 1024;
 
+#[repr(C)]
 #[derive(Debug)]
 pub struct FreeListNode<T> {
     data: MaybeUninit<T>,

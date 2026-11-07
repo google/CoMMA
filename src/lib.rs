@@ -20,9 +20,10 @@ mod event;
 mod event_ffi;
 mod fixed_batch;
 mod gcp_acs_proto; // copybara:strip(oss_protobuf)
+pub mod gpu;
 mod gpuviz;
 mod histogram;
-mod nccl_metadata;
+pub mod nccl_metadata;
 mod otel_utils; // copybara:strip(otel)
 mod profiler;
 pub mod profiler_shim;
@@ -34,7 +35,9 @@ mod step_tracker;
 use std::sync::OnceLock;
 
 use event_ffi::AsFFI as _;
-use profiler_shim::{ncclResult_t, EventDescrV1, EventDescrV2, EventDescrV3, EventDescrV4};
+use profiler_shim::{
+    ncclResult_t, EventDescrV1, EventDescrV2, EventDescrV3, EventDescrV4, EventDescrV7,
+};
 
 /// # Safety
 ///
@@ -195,6 +198,44 @@ unsafe extern "C" fn profiler_init_v4(
 }
 
 #[allow(clippy::missing_safety_doc)]
+unsafe extern "C" fn profiler_init_v7(
+    context: *mut *mut libc::c_void,
+    comm_id: u64,
+    e_activation_mask: *mut i32,
+    comm_name: *const libc::c_char,
+    n_nodes: i32,
+    n_ranks: i32,
+    rank: i32,
+    log_fn: profiler_shim::ncclDebugLogger_t,
+) -> ncclResult_t {
+    {
+        let mut lg = LOGGER_LOCK.lock().unwrap();
+        if !*lg {
+            let logger = LOGGER.get_or_init(|| NcclLogger(log_fn));
+            log::set_logger(logger)
+                .map(|()| log::set_max_level(log::LevelFilter::Trace))
+                .unwrap();
+            *lg = true;
+        }
+    }
+    match profiler::init_handler_v4(
+        &mut *e_activation_mask,
+        comm_name,
+        comm_id,
+        n_nodes,
+        n_ranks,
+        rank,
+        profiler::Version::V7,
+    ) {
+        Ok(comm) => {
+            *context = Box::into_raw(comm) as _;
+            profiler_shim::ncclResult_t_ncclSuccess
+        }
+        Err(e) => e,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
 unsafe extern "C" fn profiler_start_event_v1(
     context: *mut libc::c_void,
     e_handle: *mut *mut libc::c_void,
@@ -249,6 +290,22 @@ unsafe extern "C" fn profiler_start_event_v4(
     e_descr: *mut profiler_shim::ncclProfilerEventDescr_v4_t,
 ) -> ncclResult_t {
     let descr = &*(e_descr as *const EventDescrV4);
+    match profiler::start_event_handler(descr, context as _) {
+        Ok(event) => {
+            *e_handle = event.map_or(std::ptr::null_mut(), event::Event::into_ffi);
+            profiler_shim::ncclResult_t_ncclSuccess
+        }
+        Err(e) => e,
+    }
+}
+
+#[allow(clippy::missing_safety_doc)]
+unsafe extern "C" fn profiler_start_event_v7(
+    context: *mut libc::c_void,
+    e_handle: *mut *mut libc::c_void,
+    e_descr: *mut profiler_shim::ncclProfilerEventDescr_v7_t,
+) -> ncclResult_t {
+    let descr = &*(e_descr as *const EventDescrV7);
     match profiler::start_event_handler(descr, context as _) {
         Ok(event) => {
             *e_handle = event.map_or(std::ptr::null_mut(), event::Event::into_ffi);
@@ -362,6 +419,81 @@ unsafe extern "C" fn profiler_record_event_state_v4(
             }
         }
 
+        event_ffi::Type::KernelCh => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                let timer_state = nccl_metadata::KernelChStateV4::cast_from_union(&*e_state_args);
+                if let Err(e) =
+                    profiler::record_kernelch_event_state_handler(&mut event, e_state, timer_state)
+                {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
+            }
+        }
+
+        _ => (),
+    }
+    profiler_shim::ncclResult_t_ncclSuccess
+}
+
+#[allow(clippy::missing_safety_doc)]
+unsafe extern "C" fn profiler_record_event_state_v7(
+    e_handle: *mut libc::c_void,
+    e_state: profiler_shim::ncclProfilerEventState_v7_t,
+    e_state_args: *mut profiler_shim::ncclProfilerEventStateArgs_v7_t,
+) -> ncclResult_t {
+    let handle_type = event_ffi::get_handle_type(e_handle);
+    match handle_type {
+        event_ffi::Type::ProxyStep => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                let step_state = nccl_metadata::ProxyStepStateV7::cast_from_union(&*e_state_args);
+                if let Err(e) =
+                    profiler::record_proxystep_event_state_handler(&mut event, e_state, step_state)
+                {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
+            }
+        }
+
+        event_ffi::Type::ProxyOpLite => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                if let Err(e) = profiler::record_proxyop_event_state_handler_v4(&mut event, e_state)
+                {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
+            }
+        }
+
+        event_ffi::Type::KernelCh => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                let timer_state =
+                    nccl_metadata::KernelTimerStateV7::cast_from_union(&*e_state_args);
+                if let Err(e) =
+                    profiler::record_kernelch_event_state_handler(&mut event, e_state, timer_state)
+                {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
+            }
+        }
+
+        event_ffi::Type::KernelPhase => {
+            if let Some(mut event) = event::Event::from_ffi(e_handle) {
+                let timer_state =
+                    nccl_metadata::KernelTimerStateV7::cast_from_union(&*e_state_args);
+                if let Err(e) = profiler::record_kernelphase_event_state_handler(
+                    &mut event,
+                    e_state,
+                    timer_state,
+                ) {
+                    return e;
+                }
+                let _ = event::Event::into_ffi(event);
+            }
+        }
+
         _ => (),
     }
     profiler_shim::ncclResult_t_ncclSuccess
@@ -383,6 +515,7 @@ unsafe impl Sync for profiler_shim::ncclProfiler_v1_t {}
 unsafe impl Sync for profiler_shim::ncclProfiler_v2_t {}
 unsafe impl Sync for profiler_shim::ncclProfiler_v3_t {}
 unsafe impl Sync for profiler_shim::ncclProfiler_v4_t {}
+unsafe impl Sync for profiler_shim::ncclProfiler_v7_t {}
 
 #[allow(non_upper_case_globals)]
 #[no_mangle]
@@ -429,6 +562,18 @@ pub static ncclProfiler_v4: profiler_shim::ncclProfiler_v4_t = profiler_shim::nc
     startEvent: Some(profiler_start_event_v4),
     stopEvent: Some(profiler_stop_event),
     recordEventState: Some(profiler_record_event_state_v4),
+    finalize: Some(profiler_finalize),
+};
+
+#[allow(non_upper_case_globals)]
+#[no_mangle]
+pub static ncclProfiler_v7: profiler_shim::ncclProfiler_v7_t = profiler_shim::ncclProfiler_v7_t {
+    // SAFETY: string has no interior NUL bytes
+    name: unsafe { static_cstr!("GCP_NCCL_PROFILER_V7").as_ptr() },
+    init: Some(profiler_init_v7),
+    startEvent: Some(profiler_start_event_v7),
+    stopEvent: Some(profiler_stop_event),
+    recordEventState: Some(profiler_record_event_state_v7),
     finalize: Some(profiler_finalize),
 };
 

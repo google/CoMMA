@@ -16,6 +16,7 @@ use crate::daemon::*;
 use crate::event;
 use crate::event::ProfilerEvent as _;
 use crate::gcp_acs_proto;
+use crate::gpu;
 use crate::gpuviz;
 use crate::histogram::{Histogram1D, Histogram2D};
 use crate::nccl_metadata;
@@ -112,6 +113,7 @@ struct CollectiveSummary {
 
     plugin_major: Option<i32>,
     plugin_minor: Option<i32>,
+    comm_gpus: HashMap<(u64, usize) /* (comm_hash, rank) */, gpu::GpuDeviceMetadata>,
 }
 
 impl CollectiveSummary {
@@ -125,6 +127,7 @@ impl CollectiveSummary {
 
             plugin_major: Some(env!("CARGO_PKG_VERSION_MAJOR").parse().unwrap_or(0)),
             plugin_minor: Some(env!("CARGO_PKG_VERSION_MINOR").parse().unwrap_or(0)),
+            comm_gpus: HashMap::new(),
         }
     }
 
@@ -164,6 +167,11 @@ impl CollectiveSummary {
         let comm_hash = comm.comm_hash;
         if comm_hash.is_none() {
             return;
+        }
+        if let Some(gpu) = comm.gpu_info {
+            if let Some(rank) = comm.rank {
+                self.comm_gpus.insert((comm_hash.unwrap(), rank), gpu);
+            }
         }
         let active_comm = self
             .active_comm
@@ -249,6 +257,28 @@ impl CollectiveSummary {
             "{}",
             serde_json::to_string_pretty(&latency_distro).unwrap()
         )?;
+
+        if !self.comm_gpus.is_empty() {
+            let gpu_entries: Vec<_> = self
+                .comm_gpus
+                .iter()
+                .map(|((comm_hash, rank), gpu)| {
+                    json!({
+                        "comm": format!("0x{:016x}", comm_hash),
+                        "rank": rank,
+                        "uuid": gpu.uuid,
+                        "pcie_address": gpu.pcie_address,
+                    })
+                })
+                .collect();
+
+            let gpu_info = json!({
+                "name": "gpu_info",
+                "time": now,
+                "entries": gpu_entries,
+            });
+            writeln!(buf, "{}", serde_json::to_string_pretty(&gpu_info).unwrap())?;
+        }
 
         file.write_all(&buf).await
     }
@@ -699,7 +729,7 @@ mod tests {
                     event::ProxyOpInfo::from_descr(
                         proxyop_descr_casted,
                         id as u32,
-                        Some(Communicator::new()),
+                        /* comm_hash = */ None,
                     )
                 })
                 .collect();

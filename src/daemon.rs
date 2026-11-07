@@ -26,7 +26,8 @@ use crate::step_tracker::EventStep;
 
 use log::error;
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -137,9 +138,9 @@ pub enum Message {
         /* is_last =*/ bool,
     ),
     KernelCh(
-        /* start time */ Instant,
-        /* duration ns */ u64,
+        /* end time */ Instant,
         /* parent handle */ usize,
+        profiler::KernelChInfo,
     ),
     CommOpen(Communicator),
     CommClose(/* comm_hash = */ u64),
@@ -177,7 +178,8 @@ pub enum Telemetry {
 
 pub struct PollingContext<'a> {
     profiler: &'a Profiler,
-    pub ncclops: BTreeMap<usize, Box<event::NcclOp>>,
+    pub ncclops: HashMap<usize, Box<event::NcclOp>>,
+    reclaim_heap: BinaryHeap<Reverse<(Instant, usize)>>,
     pub pending_telemetry: VecDeque<Telemetry>,
     stop: Arc<AtomicBool>,
 
@@ -193,7 +195,8 @@ impl<'a> PollingContext<'a> {
     pub fn new(profiler: &'a Profiler, stop_signal: Arc<AtomicBool>) -> Self {
         Self {
             profiler,
-            ncclops: BTreeMap::new(),
+            ncclops: HashMap::new(),
+            reclaim_heap: BinaryHeap::new(),
             pending_telemetry: VecDeque::new(),
             stop: stop_signal,
             free_ncclop: slab::FreeList::default(),
@@ -202,11 +205,6 @@ impl<'a> PollingContext<'a> {
             peer_rank_fifo: HashMap::new(),
             pending_ipc_msg: HashMap::new(),
         }
-    }
-
-    fn reclaim_ncclop(&mut self, op: event::NcclOp) {
-        self.pending_telemetry
-            .push_back(Telemetry::NcclOp(Box::new(op)));
     }
 
     fn get_ncclop(&mut self, id: usize) -> Option<&mut event::NcclOp> {
@@ -349,7 +347,14 @@ impl<'a> PollingContext<'a> {
         // copybara:strip_begin(gpuviz)
         if let Some(parent) = info.parent() {
             if aggregate_steps && info.pid == self.profiler.pid {
-                self.try_add_histogram(thread_state, exporter, parent, id);
+                if self.ncclops.contains_key(&parent) {
+                    self.try_add_histogram(thread_state, exporter, parent, id);
+                } else if let Some(comm_hash) = info.comm_hash {
+                    // The parent ncclop is no longer tracked (e.g. it was reclaimed due to
+                    // timeout before this proxyop arrived). Fall back to the comm hash recorded
+                    // on the proxyop itself so the steps are still aggregated.
+                    self.try_add_histogram_from_comm_hash(thread_state, exporter, id, comm_hash);
+                }
             }
         }
         // copybara:strip_end
@@ -392,15 +397,19 @@ impl<'a> PollingContext<'a> {
         let record_proxyop = config.track_proxyop || config.track_steps;
         if let Some(parent_handle) = info.parent() {
             if info.pid == self.profiler.pid {
-                if let Some(ncclop) = self.get_ncclop(parent_handle) {
+                if let Some(ncclop) = self.ncclops.get_mut(&parent_handle) {
                     ncclop_update(ncclop, end_time, Some(end_time));
                     if record_proxyop {
                         for p in proxyops {
                             ncclop.add_proxyop(*p);
                         }
                     }
+                    let deadline = end_time + config.ncclop_completion_delay;
+                    self.reclaim_heap.push(Reverse((deadline, parent_handle)));
+                    return;
                 }
-                return;
+                // The parent ncclop is no longer tracked (e.g. it was reclaimed due to timeout
+                // before this proxyop ended). Export the orphan proxyop on its own below.
             } else if send_ipc {
                 let msg = InterProcessMessage::ProxyOpEnd(parent_handle, end_time);
                 self.append_ipc_message(info.pid, msg);
@@ -438,7 +447,10 @@ impl<'a> PollingContext<'a> {
             }
             Message::NcclOp(op) => {
                 let id = op.id();
+                let start_time = op.basic_info().start_time();
                 let op = self.free_ncclop.take_and_free(op);
+                let deadline = start_time + self.profiler.config.ncclop_timeout;
+                self.reclaim_heap.push(Reverse((deadline, id)));
                 let _ = self.ncclops.insert(id, Box::new(op.clone()));
                 // copybara:strip_begin(hang detection)
                 self.pending_telemetry
@@ -540,13 +552,18 @@ impl<'a> PollingContext<'a> {
                         .try_publish(&self.profiler.free_step_batch);
                 }
             }
-            Message::KernelCh(start_time, duration, parent) => {
+            Message::KernelCh(end_time, parent, info) => {
+                let init_instant = self.profiler.init_instant;
+                let dur = Duration::from_nanos(info.stop_timer.saturating_sub(info.start_timer));
+                let start_time = end_time
+                    .checked_sub(dur)
+                    .unwrap_or(init_instant)
+                    .max(init_instant);
                 if let Some(ncclop) = self.get_ncclop(parent) {
-                    ncclop_update(
-                        ncclop,
-                        start_time,
-                        Some(start_time + Duration::from_nanos(duration)),
-                    );
+                    ncclop_update(ncclop, start_time, Some(end_time));
+                    ncclop.add_kernel_ch(info);
+                    let deadline = end_time + self.profiler.config.ncclop_completion_delay;
+                    self.reclaim_heap.push(Reverse((deadline, parent)));
                 }
             }
             Message::CommOpen(comm) => {
@@ -584,6 +601,8 @@ impl<'a> PollingContext<'a> {
             InterProcessMessage::ProxyOpEnd(handle, time) => {
                 if let Some(ncclop) = self.get_ncclop(handle) {
                     ncclop_update(ncclop, time, Some(time));
+                    let deadline = time + self.profiler.config.ncclop_completion_delay;
+                    self.reclaim_heap.push(Reverse((deadline, handle)));
                 }
             }
             /* copybara:strip_begin(gpuviz) */
@@ -610,28 +629,37 @@ impl<'a> PollingContext<'a> {
         }
     }
 
-    fn try_reclaim_ncclops_from_map<P>(&mut self, mut should_reclaim: P)
-    where
-        P: FnMut(&Box<event::NcclOp>) -> ReclaimAction,
-    {
-        let mut to_keep = Vec::new();
-        while let Some((k, v)) = self.ncclops.pop_first() {
-            match should_reclaim(&v) {
-                ReclaimAction::Keep => to_keep.push((k, v)),
-                ReclaimAction::Reclaim => self.reclaim_ncclop(*v),
-                ReclaimAction::Stop => {
-                    self.ncclops.insert(k, v);
-                    break;
+    pub fn reclaim_expired_ncclops(&mut self, now: Instant) {
+        let comp_delay = self.profiler.config.ncclop_completion_delay;
+        let timeout = self.profiler.config.ncclop_timeout;
+
+        while let Some(&Reverse((deadline, id))) = self.reclaim_heap.peek() {
+            if deadline <= now {
+                self.reclaim_heap.pop();
+                let actual_deadline = match self.ncclops.get(&id) {
+                    Some(op) => match op.basic_info().end_time() {
+                        Some(et) => Some(et + comp_delay),
+                        None => Some(op.basic_info().start_time() + timeout),
+                    },
+                    None => None,
+                };
+                if let Some(actual_dl) = actual_deadline {
+                    if now >= actual_dl {
+                        if let Some(op) = self.ncclops.remove(&id) {
+                            self.pending_telemetry.push_back(Telemetry::NcclOp(op));
+                        }
+                    }
                 }
+            } else {
+                break;
             }
-        }
-        for (k, v) in to_keep {
-            self.ncclops.insert(k, v);
         }
     }
 
     pub fn reclaim_all_ncclops_in_map(&mut self) {
-        self.try_reclaim_ncclops_from_map(|_| ReclaimAction::Reclaim);
+        self.pending_telemetry
+            .extend(self.ncclops.drain().map(|(_, op)| Telemetry::NcclOp(op)));
+        self.reclaim_heap.clear();
     }
 }
 
@@ -670,28 +698,6 @@ fn ncclop_update(op: &mut event::NcclOp, st: Instant, et: Option<Instant>) {
     }
 }
 
-fn should_reclaim_ncclop(op: &event::NcclOp, comp_delay: Duration, timeout: Duration) -> bool {
-    let end_time = op.basic_info().end_time();
-    if let Some(et) = end_time {
-        let now = Instant::now();
-        if now - et > comp_delay {
-            return true;
-        }
-    }
-    let start_time = op.basic_info().start_time();
-    if start_time.elapsed() > timeout {
-        return true;
-    }
-    false
-}
-
-#[derive(Debug)]
-enum ReclaimAction {
-    Keep,
-    Reclaim,
-    Stop,
-}
-
 fn ipc_shm_path(pid: libc::pid_t) -> String {
     format!("nccl-profiler-{}", pid)
 }
@@ -701,7 +707,6 @@ const FIFO_PROCESS_BATCH: usize = 512;
 const FIFO_RECV_BATCH: usize = profiler::EVENT_QUEUE_SZ;
 const IPC_RECV_BATCH: usize = 512;
 const IPC_SEND_BATCH: usize = 64;
-const NCCLOP_RECLAIM_BATCH: usize = 512;
 
 pub fn polling_loop<E>(ctx: &mut PollingContext, mut exporter: E)
 where
@@ -721,8 +726,8 @@ where
             None
         };
 
-    let ncclop_timeout = ctx.profiler.config.ncclop_timeout;
-    let ncclop_comp_delay = ctx.profiler.config.ncclop_completion_delay;
+    let ncclop_reclaim_interval = ctx.profiler.config.ncclop_reclaim_interval;
+    let mut last_reclaim = Instant::now();
 
     while !ctx.stop.load(Ordering::Acquire) {
         while let Some(ctrl_msg) = ctx.profiler.ctrl_fifo.pop() {
@@ -815,33 +820,23 @@ where
             ctx.free_proxyop.try_publish(&ctx.profiler.free_proxyop);
         }
 
-        let mut n_processed = 0;
-        ctx.try_reclaim_ncclops_from_map(|op| {
-            if n_processed > NCCLOP_RECLAIM_BATCH {
-                return ReclaimAction::Stop;
-            }
-            n_processed += 1;
-            if should_reclaim_ncclop(op, ncclop_comp_delay, ncclop_timeout) {
-                ReclaimAction::Reclaim
-            } else {
-                ReclaimAction::Keep
-            }
-        });
-
-        if ctx.ncclops.len() > ctx.profiler.config.max_tracked_ncclop {
-            // force reclaim
-            let mut num_to_reclaim = ctx.ncclops.len() - ctx.profiler.config.max_tracked_ncclop;
-            ctx.try_reclaim_ncclops_from_map(|_| {
-                if num_to_reclaim > 0 {
-                    num_to_reclaim -= 1;
-                    ReclaimAction::Reclaim
-                } else {
-                    ReclaimAction::Stop
-                }
-            });
+        let now = Instant::now();
+        if now.duration_since(last_reclaim) >= ncclop_reclaim_interval {
+            ctx.reclaim_expired_ncclops(now);
+            last_reclaim = now;
         }
 
-        exporter.export(ctx, None)
+        while ctx.ncclops.len() > ctx.profiler.config.max_tracked_ncclop {
+            if let Some(Reverse((_, id))) = ctx.reclaim_heap.pop() {
+                if let Some(op) = ctx.ncclops.remove(&id) {
+                    ctx.pending_telemetry.push_back(Telemetry::NcclOp(op));
+                }
+            } else {
+                break;
+            }
+        }
+
+        exporter.export(ctx, None);
     }
 
     for thread in threads.iter_mut() {
@@ -869,4 +864,366 @@ where
     ctx.reclaim_all_ncclops_in_map();
 
     exporter.export(ctx, Some(RETRY_MS));
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::profiler::Version;
+    use crate::profiler_shim;
+
+    fn make_test_context<'a>(profiler: &'a Profiler) -> PollingContext<'a> {
+        let stop = Arc::new(AtomicBool::new(false));
+        PollingContext::new(profiler, stop)
+    }
+
+    fn dummy_op(id: usize, start_time: Instant) -> event::NcclOp {
+        let descr = profiler_shim::tests::dummy_coll_descr();
+        event::NcclOp::from_descr(&descr, start_time, id, None)
+    }
+
+    #[test]
+    fn test_reclaim_timeout() {
+        let mut profiler = Profiler::new(Version::V1);
+        profiler.config.ncclop_timeout = Duration::from_secs(10);
+        profiler.config.ncclop_completion_delay = Duration::from_secs(2);
+
+        let mut ctx = make_test_context(&profiler);
+        let t0 = Instant::now();
+
+        // Op 1 created at t0 (deadline = t0 + 10s)
+        let op = dummy_op(1, t0);
+        let deadline = t0 + profiler.config.ncclop_timeout;
+        ctx.reclaim_heap.push(Reverse((deadline, 1)));
+        ctx.ncclops.insert(1, Box::new(op));
+
+        // At t0 + 5s: not expired yet
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_secs(5));
+        assert_eq!(ctx.ncclops.len(), 1);
+        assert_eq!(ctx.pending_telemetry.len(), 0);
+
+        // At t0 + 10s: expired!
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_secs(10));
+        assert_eq!(ctx.ncclops.len(), 0);
+        assert_eq!(ctx.pending_telemetry.len(), 1);
+        match ctx.pending_telemetry.pop_front().unwrap() {
+            Telemetry::NcclOp(reclaimed) => assert_eq!(reclaimed.id(), 1),
+            _ => panic!("Expected Telemetry::NcclOp"),
+        }
+    }
+
+    #[test]
+    fn test_reclaim_early_completion_via_proxyop() {
+        let mut profiler = Profiler::new(Version::V1);
+        profiler.config.ncclop_timeout = Duration::from_secs(10);
+        profiler.config.ncclop_completion_delay = Duration::from_secs(2);
+
+        let mut ctx = make_test_context(&profiler);
+        let t0 = Instant::now();
+
+        // Op 1 created at t0 (initial deadline = t0 + 10s)
+        let op = dummy_op(1, t0);
+        let timeout_deadline = t0 + profiler.config.ncclop_timeout;
+        ctx.reclaim_heap.push(Reverse((timeout_deadline, 1)));
+        ctx.ncclops.insert(1, Box::new(op));
+
+        // At t0 + 1s, proxy op finishes: end_time = t0 + 1s
+        let end_time = t0 + Duration::from_secs(1);
+        ncclop_update(ctx.get_ncclop(1).unwrap(), end_time, Some(end_time));
+        let comp_deadline = end_time + profiler.config.ncclop_completion_delay; // t0 + 3s
+        ctx.reclaim_heap.push(Reverse((comp_deadline, 1)));
+
+        // At t0 + 2.5s: comp_delay (2s after t0+1s) has not elapsed yet
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_millis(2500));
+        assert_eq!(ctx.ncclops.len(), 1);
+        assert_eq!(ctx.pending_telemetry.len(), 0);
+
+        // At t0 + 3.1s: comp_delay has elapsed! Should reclaim early before 10s timeout
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_millis(3100));
+        assert_eq!(ctx.ncclops.len(), 0);
+        assert_eq!(ctx.pending_telemetry.len(), 1);
+
+        // Later at t0 + 10.5s: the original timeout token pops from the heap
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_millis(10500));
+        // Should NOT emit duplicate telemetry!
+        assert_eq!(ctx.pending_telemetry.len(), 1);
+    }
+
+    #[test]
+    fn test_reclaim_multiple_proxyops_extending_endtime() {
+        let mut profiler = Profiler::new(Version::V1);
+        profiler.config.ncclop_timeout = Duration::from_secs(10);
+        profiler.config.ncclop_completion_delay = Duration::from_secs(2);
+
+        let mut ctx = make_test_context(&profiler);
+        let t0 = Instant::now();
+
+        // Op 1 created at t0
+        let op = dummy_op(1, t0);
+        ctx.reclaim_heap
+            .push(Reverse((t0 + profiler.config.ncclop_timeout, 1)));
+        ctx.ncclops.insert(1, Box::new(op));
+
+        // Proxy op 1 ends at t0 + 1s (deadline = t0 + 3s)
+        let et1 = t0 + Duration::from_secs(1);
+        ncclop_update(ctx.get_ncclop(1).unwrap(), et1, Some(et1));
+        ctx.reclaim_heap
+            .push(Reverse((et1 + profiler.config.ncclop_completion_delay, 1)));
+
+        // Proxy op 2 ends at t0 + 2s (deadline = t0 + 4s)
+        let et2 = t0 + Duration::from_secs(2);
+        ncclop_update(ctx.get_ncclop(1).unwrap(), et2, Some(et2));
+        ctx.reclaim_heap
+            .push(Reverse((et2 + profiler.config.ncclop_completion_delay, 1)));
+
+        // At t0 + 3.5s: token 1 (deadline t0+3s) pops, but end_time is t0+2s so actual deadline is t0+4s.
+        // Op 1 must NOT be reclaimed!
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_millis(3500));
+        assert_eq!(ctx.ncclops.len(), 1);
+        assert_eq!(ctx.pending_telemetry.len(), 0);
+
+        // At t0 + 4.1s: token 2 (deadline t0+4s) pops. Now actual deadline has passed!
+        ctx.reclaim_expired_ncclops(t0 + Duration::from_millis(4100));
+        assert_eq!(ctx.ncclops.len(), 0);
+        assert_eq!(ctx.pending_telemetry.len(), 1);
+    }
+
+    #[test]
+    fn test_reclaim_capacity_overflow() {
+        let mut profiler = Profiler::new(Version::V1);
+        profiler.config.max_tracked_ncclop = 2;
+        profiler.config.ncclop_timeout = Duration::from_secs(10);
+
+        let mut ctx = make_test_context(&profiler);
+        let t0 = Instant::now();
+
+        // Insert 3 ops (limit is 2)
+        for id in 1..=3 {
+            let op = dummy_op(id, t0 + Duration::from_millis(id as u64 * 10));
+            let deadline = t0 + Duration::from_secs(10) + Duration::from_millis(id as u64 * 10);
+            ctx.reclaim_heap.push(Reverse((deadline, id)));
+            ctx.ncclops.insert(id, Box::new(op));
+        }
+
+        assert_eq!(ctx.ncclops.len(), 3);
+
+        // Simulate overflow check
+        while ctx.ncclops.len() > ctx.profiler.config.max_tracked_ncclop {
+            if let Some(Reverse((_, id))) = ctx.reclaim_heap.pop() {
+                if let Some(op) = ctx.ncclops.remove(&id) {
+                    ctx.pending_telemetry.push_back(Telemetry::NcclOp(op));
+                }
+            } else {
+                break;
+            }
+        }
+
+        assert_eq!(ctx.ncclops.len(), 2);
+        assert_eq!(ctx.pending_telemetry.len(), 1);
+        // The oldest op (id = 1) was force-reclaimed
+        match ctx.pending_telemetry.pop_front().unwrap() {
+            Telemetry::NcclOp(reclaimed) => assert_eq!(reclaimed.id(), 1),
+            _ => panic!("Expected Telemetry::NcclOp"),
+        }
+        assert!(ctx.ncclops.contains_key(&2));
+        assert!(ctx.ncclops.contains_key(&3));
+    }
+
+    #[test]
+    fn test_reclaim_all_ncclops_in_map() {
+        let profiler = Profiler::new(Version::V1);
+        let mut ctx = make_test_context(&profiler);
+        let t0 = Instant::now();
+
+        for id in 1..=5 {
+            let op = dummy_op(id, t0);
+            ctx.reclaim_heap
+                .push(Reverse((t0 + Duration::from_secs(10), id)));
+            ctx.ncclops.insert(id, Box::new(op));
+        }
+
+        assert_eq!(ctx.ncclops.len(), 5);
+        ctx.reclaim_all_ncclops_in_map();
+        assert_eq!(ctx.ncclops.len(), 0);
+        assert_eq!(ctx.reclaim_heap.len(), 0);
+        assert_eq!(ctx.pending_telemetry.len(), 5);
+    }
+
+    // copybara:strip_begin(gpuviz)
+    #[derive(Debug, Default)]
+    struct CountingHistogram {
+        count: std::sync::atomic::AtomicUsize,
+    }
+
+    impl AtomicHistogram<EventStep> for CountingHistogram {
+        fn record(&self, _data: &EventStep) {
+            self.count.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Default)]
+    struct MockExporter {
+        requested_keys: std::sync::Mutex<Vec<nccl_metadata::NcclOpKey>>,
+        histogram: Arc<CountingHistogram>,
+    }
+
+    impl Export for MockExporter {
+        fn export(&self, _ctx: &mut PollingContext, _maybe_retry_ms: Option<u64>) {}
+
+        fn get_latency_histogram(
+            &self,
+            key: &nccl_metadata::NcclOpKey,
+        ) -> Option<impl std::iter::IntoIterator<Item = Arc<dyn AtomicHistogram<EventStep>>>>
+        {
+            self.requested_keys.lock().unwrap().push(key.clone());
+            Some(vec![
+                self.histogram.clone() as Arc<dyn AtomicHistogram<EventStep>>
+            ])
+        }
+    }
+
+    fn send_last_step_batch(
+        ctx: &mut PollingContext,
+        thread_state: &mut ThreadState,
+        exporter: &mut MockExporter,
+        info: event::ProxyOpInfo,
+    ) {
+        let mut step_batch_list = slab::FreeList::new_list(1);
+        // SAFETY: alloc() always calls the closure with a valid pointer
+        let mut steps = step_batch_list
+            .alloc(|p| unsafe { StepBatch::init(p) }, None, false)
+            .unwrap();
+        steps.push(EventStep {
+            step: 0,
+            size: 65536,
+            start_time: 123,
+            fifo_wait_dur_ns: None,
+            dur_ns: 256,
+        });
+        ctx.handle_fifo_message(
+            Message::StepBatch(info, steps, /* is_last = */ true),
+            thread_state,
+            exporter,
+        );
+    }
+
+    fn proxyop_info(pid: libc::pid_t, parent: usize, comm_hash: Option<u64>) -> event::ProxyOpInfo {
+        event::ProxyOpInfo {
+            rank: 2,
+            parent: crate::event_ffi::ProxyParent::NcclOp(parent),
+            pid,
+            id: 7,
+            peer: 3,
+            is_send: true,
+            comm_hash,
+        }
+    }
+
+    #[test]
+    fn test_proxyop_falls_back_to_own_comm_hash_when_parent_reclaimed() {
+        let mut profiler = Profiler::new(Version::V4);
+        profiler.config.aggregate_steps = true;
+        profiler.config.track_steps = false;
+        let pid = profiler.pid;
+
+        let mut ctx = make_test_context(&profiler);
+        let mut thread_state = ThreadState::default();
+        let mut exporter = MockExporter::default();
+
+        // Parent ncclop (handle 1) is not in ctx.ncclops, e.g. it was already reclaimed.
+        let info = proxyop_info(pid, 1, Some(0xabcd));
+        send_last_step_batch(&mut ctx, &mut thread_state, &mut exporter, info);
+
+        assert_eq!(
+            *exporter.requested_keys.lock().unwrap(),
+            vec![nccl_metadata::NcclOpKey::NetSend(0xabcd, 2, 3)]
+        );
+        assert_eq!(exporter.histogram.count.load(Ordering::Relaxed), 1);
+        assert!(thread_state.proxyops.is_empty());
+    }
+
+    #[test]
+    fn test_proxyop_prefers_parent_comm_hash() {
+        let mut profiler = Profiler::new(Version::V4);
+        profiler.config.aggregate_steps = true;
+        profiler.config.track_steps = false;
+        let pid = profiler.pid;
+
+        let mut ctx = make_test_context(&profiler);
+        let mut thread_state = ThreadState::default();
+        let mut exporter = MockExporter::default();
+
+        let descr = profiler_shim::tests::dummy_coll_descr();
+        let ncclop = event::NcclOp::from_descr(&descr, Instant::now(), 1, Some(0x1234));
+        ctx.ncclops.insert(1, Box::new(ncclop));
+
+        let info = proxyop_info(pid, 1, Some(0xabcd));
+        send_last_step_batch(&mut ctx, &mut thread_state, &mut exporter, info);
+
+        let keys = exporter.requested_keys.lock().unwrap();
+        assert_eq!(keys.len(), 1);
+        assert_eq!(keys[0].get_comm_hash(), 0x1234);
+        assert_eq!(exporter.histogram.count.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn test_proxyop_without_parent_or_comm_hash_is_not_aggregated() {
+        let mut profiler = Profiler::new(Version::V4);
+        profiler.config.aggregate_steps = true;
+        profiler.config.track_steps = false;
+        let pid = profiler.pid;
+
+        let mut ctx = make_test_context(&profiler);
+        let mut thread_state = ThreadState::default();
+        let mut exporter = MockExporter::default();
+
+        let info = proxyop_info(pid, 1, None);
+        send_last_step_batch(&mut ctx, &mut thread_state, &mut exporter, info);
+
+        assert!(exporter.requested_keys.lock().unwrap().is_empty());
+        assert_eq!(exporter.histogram.count.load(Ordering::Relaxed), 0);
+    }
+    // copybara:strip_end
+
+    #[test]
+    fn test_orphan_local_proxyop_is_exported_standalone() {
+        let mut profiler = Profiler::new(Version::V4);
+        profiler.config.track_proxyop = true;
+        let pid = profiler.pid;
+
+        let mut ctx = make_test_context(&profiler);
+        let info = event::ProxyOpInfo {
+            rank: 2,
+            parent: crate::event_ffi::ProxyParent::NcclOp(1),
+            pid,
+            id: 7,
+            peer: 3,
+            is_send: true,
+            comm_hash: Some(0xabcd),
+        };
+        let now = Instant::now();
+
+        // Parent ncclop (handle 1) is not tracked: proxyop should be exported on its own.
+        let proxyop = Box::new(event::ProxyOp::from_info(&info, now));
+        ctx.handle_proxyop_end(now, &info, vec![proxyop], true);
+        assert_eq!(ctx.pending_telemetry.len(), 1);
+        match ctx.pending_telemetry.pop_front().unwrap() {
+            Telemetry::ProxyOp(p) => {
+                let record = p.trace_record(|_| 0);
+                assert_eq!(record["comm_hash"], "0x000000000000abcd");
+                assert_eq!(record["parent"], "<ncclop 1>");
+            }
+            _ => panic!("Expected Telemetry::ProxyOp"),
+        }
+        assert!(ctx.reclaim_heap.is_empty());
+
+        // Parent ncclop is tracked: proxyop should be attached to it instead.
+        ctx.ncclops.insert(1, Box::new(dummy_op(1, now)));
+        let proxyop = Box::new(event::ProxyOp::from_info(&info, now));
+        ctx.handle_proxyop_end(now, &info, vec![proxyop], true);
+        assert!(ctx.pending_telemetry.is_empty());
+        assert_eq!(ctx.reclaim_heap.len(), 1);
+        let record = ctx.ncclops[&1].trace_record(|_| 0);
+        assert_eq!(record["proxyops"].as_array().unwrap().len(), 1);
+    }
 }

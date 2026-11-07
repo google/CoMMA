@@ -86,6 +86,18 @@ impl<T, const N: usize> Batch<T, N> {
     }
 }
 
+impl<T, const N: usize> std::ops::Drop for Batch<T, N> {
+    fn drop(&mut self) {
+        for i in 0..self.num_elements {
+            // SAFETY: num_elements only updated with push(),
+            // where the corresponding entry is also set.
+            unsafe {
+                self.elements[i].assume_init_drop();
+            }
+        }
+    }
+}
+
 pub const FIXED_QUEUE_SIZE: usize = 4;
 
 /// A queue (FIFO) data structure that uses a fix-sized buffer.
@@ -108,7 +120,12 @@ pub struct StepQueue<T, const N: usize = FIXED_QUEUE_SIZE> {
 
 impl<T, const N: usize> StepQueue<T, N> {
     pub fn new() -> Self {
-        assert!(N < u8::MAX as usize);
+        const {
+            assert!(
+                N < u8::MAX as usize,
+                "Queue size N must be less than 255 to fit in hd_idx (u8)"
+            );
+        }
         Self {
             fixed_arr: [const { MaybeUninit::uninit() }; N],
             hd_idx: 0,
@@ -206,9 +223,9 @@ impl<T, const N: usize> StepQueue<T, N> {
                 ele = unsafe { f(self.fixed_arr[arr_idx].assume_init_read()) };
                 let mut dst: usize = self.hd_idx as _;
                 if idx == 0 {
-                    self.hd_idx = (self.hd_idx + 1) % N as u8;
+                    self.hd_idx = ((self.hd_idx as usize + 1) % N) as u8;
                 } else {
-                    let mut i = (idx + 1) % N;
+                    let mut i = idx + 1;
                     dst = arr_idx;
                     while i < std::cmp::min(N, self.len as _) {
                         let src = (self.hd_idx as usize + i) % N;
@@ -233,7 +250,7 @@ impl<T, const N: usize> StepQueue<T, N> {
     }
 
     pub fn _len(&self) -> usize {
-        self.len + self.fallback.len()
+        self.len
     }
 
     #[cfg(test)]
@@ -373,5 +390,61 @@ mod tests {
                 expected += 1;
             }
         }
+    }
+
+    #[test]
+    fn test_stepqueue_remove_at_all_indices() {
+        for total_len in 1..=FIXED_QUEUE_SIZE + 2 {
+            for start_offset in 0..FIXED_QUEUE_SIZE {
+                for remove_idx in 0..total_len {
+                    let mut q: StepQueue<StepTestData> = StepQueue::new();
+                    for _ in 0..start_offset {
+                        q.push_back(StepTestData::new(999));
+                        q.remove(0);
+                    }
+                    for i in 0..total_len {
+                        q.push_back(StepTestData::new(i as _));
+                    }
+                    let removed = q.remove(remove_idx).unwrap();
+                    assert_eq!(removed.data, remove_idx as u64);
+                    assert_eq!(q.len, total_len - 1);
+
+                    let mut expected = Vec::new();
+                    for i in 0..total_len {
+                        if i != remove_idx {
+                            expected.push(i as u64);
+                        }
+                    }
+                    for exp in expected {
+                        let head = q.remove(0).unwrap();
+                        assert_eq!(head.data, exp);
+                    }
+                    assert_eq!(q.len, 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn batch_drop() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        struct DropCounter(Arc<AtomicUsize>);
+        impl Drop for DropCounter {
+            fn drop(&mut self) {
+                self.0.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        {
+            let mut batch = Batch::<DropCounter, 10>::default();
+            for _ in 0..5 {
+                batch.push(DropCounter(counter.clone()));
+            }
+            assert_eq!(counter.load(Ordering::SeqCst), 0);
+        }
+        assert_eq!(counter.load(Ordering::SeqCst), 5);
     }
 }

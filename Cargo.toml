@@ -16,8 +16,16 @@ crate-type = ["cdylib", "rlib"]
 name = "integration_benchmark"
 path = "src/integration_benchmark.rs"
 
+[[bin]]
+name = "gpu_detect"
+path = "src/gpu_detect.rs"
+
 [[bench]]
 name = "clock"
+harness = false
+
+[[bench]]
+name = "metadata"
 harness = false
 
 [features]
@@ -52,3 +60,5 @@ static_assertions = "1.1.0"
 tempfile = "3.19.0"
 tokio = { version = "1.43.0", features = ["full"] }
 tonic = { version = "0.12.3", features = ["tls", "tls-native-roots", "tls-webpki-roots"] }
+nvml-wrapper = "0.12.1"
+

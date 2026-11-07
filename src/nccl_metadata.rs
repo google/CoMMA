@@ -17,8 +17,10 @@ use crate::profiler_shim;
 
 use serde_json::json;
 
+#[cfg(test)]
 use std::collections::HashMap;
 use std::ffi::CStr;
+#[cfg(test)]
 use std::sync::LazyLock;
 
 pub fn datatype_num_bytes(datatype: i32) -> usize {
@@ -45,6 +47,7 @@ pub fn datatype_num_bytes(datatype: i32) -> usize {
     }
 }
 
+#[cfg(test)]
 static DATATYPE_NAME_TO_BYTES: LazyLock<HashMap<&'static CStr, usize>> = LazyLock::new(|| {
     [
         (c"ncclInt8", 1),
@@ -64,19 +67,13 @@ static DATATYPE_NAME_TO_BYTES: LazyLock<HashMap<&'static CStr, usize>> = LazyLoc
     .collect()
 });
 
-fn datatype_name_to_nbytes(name: &CStr) -> usize {
-    // as an optimization we use the last few character to infer the datatype size
-    let bytes = name.to_bytes();
-    let i = bytes.len() - 1;
-    match bytes[i] {
-        b'8' => 1, // 8
-        b'6' => 2, // 16
-        b'2' => match bytes[i - 1] {
-            b'3' => 4, // 32
-            _ => 1,
-        },
-        b'4' => 8, // 64
-        _ => DATATYPE_NAME_TO_BYTES.get(name).cloned().unwrap_or(1),
+pub fn datatype_name_to_nbytes(name: &CStr) -> usize {
+    match name.to_bytes() {
+        b"ncclInt8" | b"ncclFloat8e4m3" | b"ncclFloat8e5m2" => 1,
+        b"ncclFloat16" | b"ncclBfloat16" => 2,
+        b"ncclInt32" | b"ncclUint32" | b"ncclFloat32" => 4,
+        b"ncclInt64" | b"ncclUint64" | b"ncclFloat64" => 8,
+        _ => 1,
     }
 }
 
@@ -104,6 +101,7 @@ pub enum NcclOpType {
     Unknown,
 }
 
+#[cfg(test)]
 static NCCLOP_NAME_LOOKUP: LazyLock<HashMap<&'static CStr, NcclOpType>> = LazyLock::new(|| {
     [
         (c"Broadcast", NcclOpType::Broadcast),
@@ -134,26 +132,15 @@ impl NcclOpType {
     }
 
     pub fn from_c_str(name: &CStr) -> NcclOpType {
-        let bytes = name.to_bytes();
-        let last_idx = bytes.len() - 1;
-        match bytes[0] {
-            b'B' => NcclOpType::Broadcast,
-            b'R' => match bytes[last_idx] {
-                b'e' => NcclOpType::Reduce,
-                b'r' => NcclOpType::ReduceScatter,
-                b'v' => NcclOpType::Recv,
-                _ => NcclOpType::Unknown,
-            },
-            b'A' => match bytes[last_idx] {
-                b'r' => NcclOpType::AllGather,
-                b'e' => NcclOpType::AllReduce,
-                _ => NcclOpType::Unknown,
-            },
-            b'S' => NcclOpType::Send,
-            _ => NCCLOP_NAME_LOOKUP
-                .get(name)
-                .cloned()
-                .unwrap_or(NcclOpType::Unknown),
+        match name.to_bytes() {
+            b"Broadcast" => NcclOpType::Broadcast,
+            b"Reduce" => NcclOpType::Reduce,
+            b"AllGather" => NcclOpType::AllGather,
+            b"ReduceScatter" => NcclOpType::ReduceScatter,
+            b"AllReduce" => NcclOpType::AllReduce,
+            b"Send" => NcclOpType::Send,
+            b"Recv" => NcclOpType::Recv,
+            _ => NcclOpType::Unknown,
         }
     }
 
@@ -218,9 +205,9 @@ impl IntoNcclOpType for *const libc::c_char {
 }
 
 pub mod algo {
-    use std::collections::HashMap;
     use std::ffi::CStr;
-    use std::sync::LazyLock;
+    #[cfg(test)]
+    use std::{collections::HashMap, sync::LazyLock};
 
     pub const TREE: u8 = 0;
     pub const RING: u8 = 1;
@@ -233,6 +220,7 @@ pub mod algo {
 
     // this extra mapping decouples what NCCL use as algo names as what profiler
     // uses for reporting them
+    #[cfg(test)]
     pub(super) static ALGO_NAME_LOOKUP: LazyLock<HashMap<&'static CStr, u8>> =
         LazyLock::new(|| {
             [
@@ -262,21 +250,15 @@ pub mod algo {
     }
 
     pub fn from_name(name: &CStr) -> u8 {
-        let bytes = name.to_bytes();
-        let last_idx = bytes.len() - 1;
-        match bytes[0] {
-            b'T' => TREE,
-            b'R' => RING,
-            b'C' => match bytes[last_idx] {
-                b'T' => COLLNET_DIRECT,
-                _ => COLLNET_CHAIN,
-            },
-            b'N' => match bytes[last_idx] {
-                b'E' => NVLS_TREE,
-                _ => NVLS,
-            },
-            b'P' => PAT,
-            _ => ALGO_NAME_LOOKUP.get(name).cloned().unwrap_or(UNKNOWN),
+        match name.to_bytes() {
+            b"TREE" => TREE,
+            b"RING" => RING,
+            b"COLLNET_DIRECT" => COLLNET_DIRECT,
+            b"COLLNET_CHAIN" => COLLNET_CHAIN,
+            b"NVLS" => NVLS,
+            b"NVLS_TREE" => NVLS_TREE,
+            b"PAT" => PAT,
+            _ => UNKNOWN,
         }
     }
 
@@ -327,28 +309,12 @@ pub mod algo {
 }
 
 pub mod proto {
-    use std::collections::HashMap;
     use std::ffi::CStr;
-    use std::sync::LazyLock;
 
     pub const LL: u8 = 0;
     pub const LL128: u8 = 1;
     pub const SIMPLE: u8 = 2;
     pub const UNKNOWN: u8 = 3;
-
-    // this extra mapping decouples what NCCL use as proto names as what profiler
-    // uses for reporting them
-    static PROTO_NAME_LOOKUP: LazyLock<HashMap<&'static CStr, u8>> = LazyLock::new(|| {
-        [
-            (c"LL", LL),
-            (c"LL128", LL128),
-            (c"SIMPLE", SIMPLE),
-            (c"Unknown", UNKNOWN),
-        ]
-        .iter()
-        .cloned()
-        .collect()
-    });
 
     /// # Safety
     ///
@@ -362,7 +328,12 @@ pub mod proto {
     }
 
     pub fn from_name(name: &CStr) -> u8 {
-        PROTO_NAME_LOOKUP.get(name).cloned().unwrap_or(UNKNOWN)
+        match name.to_bytes() {
+            b"LL" => LL,
+            b"LL128" => LL128,
+            b"SIMPLE" => SIMPLE,
+            _ => UNKNOWN,
+        }
     }
 
     pub fn name(algo: u8) -> &'static str {
@@ -430,7 +401,7 @@ impl NcclOpKey {
     where
         D: Version + Event,
     {
-        match descr.type_() as u32 {
+        match descr.type_() {
             profiler_shim::ncclProfileColl => {
                 // SAFETY: just checked that event type is collective
                 let coll = unsafe { descr.cast_to_coll() };
@@ -518,7 +489,7 @@ fn event_byte_count<D>(descr: &D) -> usize
 where
     D: Version + Event,
 {
-    match descr.type_() as u32 {
+    match descr.type_() {
         profiler_shim::ncclProfileColl => {
             // SAFETY: just checked that event type is collective
             let coll = unsafe { descr.cast_to_coll() };
@@ -539,6 +510,7 @@ pub enum EventMetadata {
     V2(profiler_shim::EventDescrV2),
     V3(profiler_shim::EventDescrV3),
     V4(profiler_shim::EventDescrV4),
+    V7(profiler_shim::EventDescrV7),
 }
 
 /// # Safety
@@ -555,6 +527,7 @@ impl EventMetadata {
             Self::V2(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
             Self::V3(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
             Self::V4(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
+            Self::V7(descr) => NcclOpKey::from_descr(descr, alt_comm_hash),
         }
     }
 
@@ -568,6 +541,7 @@ impl EventMetadata {
             Self::V2(descr) => event_byte_count(descr),
             Self::V3(descr) => event_byte_count(descr),
             Self::V4(descr) => event_byte_count(descr),
+            Self::V7(descr) => event_byte_count(descr),
         }
     }
 
@@ -577,6 +551,7 @@ impl EventMetadata {
             Self::V2(descr) => descr.try_cast_to_coll().map(|x| x as _),
             Self::V3(descr) => descr.try_cast_to_coll().map(|x| x as _),
             Self::V4(descr) => descr.try_cast_to_coll().map(|x| x as _),
+            Self::V7(descr) => descr.try_cast_to_coll().map(|x| x as _),
         }
     }
 
@@ -586,13 +561,14 @@ impl EventMetadata {
             Self::V2(descr) => descr.try_cast_to_p2p().map(|x| x as _),
             Self::V3(descr) => descr.try_cast_to_p2p().map(|x| x as _),
             Self::V4(descr) => descr.try_cast_to_p2p().map(|x| x as _),
+            Self::V7(descr) => descr.try_cast_to_p2p().map(|x| x as _),
         }
     }
 }
 
 pub trait Event {
     fn rank(&self) -> i32;
-    fn type_(&self) -> u8;
+    fn type_(&self) -> u32;
     fn parent_obj(&self) -> *mut libc::c_void;
     fn clone_to_metadata(&self) -> EventMetadata;
 }
@@ -602,6 +578,8 @@ pub trait Version: Event {
     type P2p: P2p;
     type ProxyOp: ProxyOp;
     type ProxyStep: ProxyStep;
+    type KernelCh: KernelCh;
+    type KernelPhase: KernelPhase;
 
     fn version() -> profiler::Version;
 
@@ -641,9 +619,27 @@ pub trait Version: Event {
         &*ptr.cast()
     }
 
+    /// # Safety
+    ///
+    /// type of this descriptor must be kernelCh
+    #[inline(always)]
+    unsafe fn cast_to_kernelch(&self) -> &Self::KernelCh {
+        let ptr = self as *const Self;
+        &*ptr.cast()
+    }
+
+    /// # Safety
+    ///
+    /// type of this descriptor must be kernelPhase
+    #[inline(always)]
+    unsafe fn cast_to_kernelphase(&self) -> &Self::KernelPhase {
+        let ptr = self as *const Self;
+        &*ptr.cast()
+    }
+
     #[inline(always)]
     fn try_cast_to_coll(&self) -> Option<&Self::Coll> {
-        if self.type_() as u32 == profiler_shim::ncclProfileColl {
+        if self.type_() == profiler_shim::ncclProfileColl {
             // SAFETY: just checked that event type is collective
             Some(unsafe { self.cast_to_coll() })
         } else {
@@ -653,7 +649,7 @@ pub trait Version: Event {
 
     #[inline(always)]
     fn try_cast_to_p2p(&self) -> Option<&Self::P2p> {
-        if self.type_() as u32 == profiler_shim::ncclProfileP2p {
+        if self.type_() == profiler_shim::ncclProfileP2p {
             // SAFETY: just checked that event type is collective
             Some(unsafe { self.cast_to_p2p() })
         } else {
@@ -735,6 +731,23 @@ pub trait ProxyStepState {
     fn trans_size(&self) -> usize;
 }
 
+pub trait KernelCh: Event {
+    #![allow(dead_code)]
+    fn channel_id(&self) -> u8;
+    fn start_timer(&self) -> u64;
+}
+
+pub trait KernelPhase: Event {
+    #![allow(dead_code)]
+    fn channel_id(&self) -> u8;
+    fn phase_id(&self) -> u8;
+    fn start_timer(&self) -> u64;
+}
+
+pub trait KernelTimerState {
+    fn stop_timer(&self) -> u64;
+}
+
 macro_rules! impl_event {
     ($t:tt, $v:expr) => {
         impl Event for $t {
@@ -744,7 +757,7 @@ macro_rules! impl_event {
             }
 
             #[inline(always)]
-            fn type_(&self) -> u8 {
+            fn type_(&self) -> u32 {
                 self.0.type_()
             }
 
@@ -770,8 +783,8 @@ macro_rules! descr_impl_event {
             }
 
             #[inline(always)]
-            fn type_(&self) -> u8 {
-                self.0.type_
+            fn type_(&self) -> u32 {
+                self.0.type_ as u32
             }
 
             #[inline(always)]
@@ -986,6 +999,45 @@ mod v1 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV1));
     impl_event!(ProxyStep, EventMetadata::V1);
+
+    #[repr(transparent)]
+    pub struct KernelCh(profiler_shim::EventDescrV1);
+
+    impl_event!(KernelCh, EventMetadata::V1);
+
+    impl super::KernelCh for KernelCh {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
+
+    #[repr(transparent)]
+    pub struct KernelPhase(profiler_shim::EventDescrV1);
+
+    impl_event!(KernelPhase, EventMetadata::V1);
+
+    impl super::KernelPhase for KernelPhase {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn phase_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
 }
 
 mod v2 {
@@ -1015,6 +1067,45 @@ mod v2 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV2));
     impl_event!(ProxyStep, EventMetadata::V2);
+
+    #[repr(transparent)]
+    pub struct KernelCh(profiler_shim::EventDescrV2);
+
+    impl_event!(KernelCh, EventMetadata::V2);
+
+    impl super::KernelCh for KernelCh {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
+
+    #[repr(transparent)]
+    pub struct KernelPhase(profiler_shim::EventDescrV2);
+
+    impl_event!(KernelPhase, EventMetadata::V2);
+
+    impl super::KernelPhase for KernelPhase {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn phase_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
 }
 
 mod v3 {
@@ -1044,6 +1135,45 @@ mod v3 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV3));
     impl_event!(ProxyStep, EventMetadata::V3);
+
+    #[repr(transparent)]
+    pub struct KernelCh(profiler_shim::EventDescrV3);
+
+    impl_event!(KernelCh, EventMetadata::V3);
+
+    impl super::KernelCh for KernelCh {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelCh.channelId }
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
+
+    #[repr(transparent)]
+    pub struct KernelPhase(profiler_shim::EventDescrV3);
+
+    impl_event!(KernelPhase, EventMetadata::V3);
+
+    impl super::KernelPhase for KernelPhase {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn phase_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
 }
 
 mod v4 {
@@ -1109,6 +1239,154 @@ mod v4 {
 
     def_proxystep!(ProxyStep, (profiler_shim::EventDescrV4));
     impl_event!(ProxyStep, EventMetadata::V4);
+
+    #[repr(transparent)]
+    pub struct KernelCh(profiler_shim::EventDescrV4);
+
+    impl_event!(KernelCh, EventMetadata::V4);
+
+    impl super::KernelCh for KernelCh {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelCh.channelId }
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelCh.pTimer }
+        }
+    }
+
+    #[repr(transparent)]
+    pub struct KernelPhase(profiler_shim::EventDescrV4);
+
+    impl_event!(KernelPhase, EventMetadata::V4);
+
+    impl super::KernelPhase for KernelPhase {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn phase_id(&self) -> u8 {
+            0
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            0
+        }
+    }
+}
+
+pub mod v7 {
+    use super::algo::IntoAlgo;
+    use super::proto::IntoProto;
+    use super::*;
+
+    #[repr(transparent)]
+    pub struct Coll(profiler_shim::EventDescrV7);
+
+    impl_event!(Coll, EventMetadata::V7);
+
+    impl NcclOp for Coll {
+        #[inline(always)]
+        fn comm_hash(&self) -> Option<u64> {
+            None
+        }
+
+        #[inline(always)]
+        fn byte_count(&self) -> usize {
+            let coll = unsafe { &self.0 .0.__bindgen_anon_1.coll };
+            let dt_bytes = unsafe { datatype_c_str_ptr_to_nbytes(coll.datatype) };
+            (coll.count * dt_bytes) as _
+        }
+    }
+
+    impl_coll!(Coll, nChannels);
+
+    #[repr(transparent)]
+    pub struct P2p(profiler_shim::EventDescrV7);
+
+    impl_event!(P2p, EventMetadata::V7);
+
+    impl NcclOp for P2p {
+        #[inline(always)]
+        fn comm_hash(&self) -> Option<u64> {
+            None
+        }
+
+        #[inline(always)]
+        fn byte_count(&self) -> usize {
+            let p2p = unsafe { &self.0 .0.__bindgen_anon_1.p2p };
+            let dt_bytes = unsafe { datatype_c_str_ptr_to_nbytes(p2p.datatype) };
+            (p2p.count * dt_bytes) as _
+        }
+    }
+
+    impl_p2p!(P2p);
+
+    #[repr(transparent)]
+    pub struct ProxyOp(profiler_shim::EventDescrV7);
+
+    impl_event!(ProxyOp, EventMetadata::V7);
+    impl_proxyop!(ProxyOp);
+
+    def_proxystep!(ProxyStep, (profiler_shim::EventDescrV7));
+    impl_event!(ProxyStep, EventMetadata::V7);
+
+    #[repr(transparent)]
+    pub struct KernelCh(profiler_shim::EventDescrV7);
+
+    impl_event!(KernelCh, EventMetadata::V7);
+
+    impl super::KernelCh for KernelCh {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelCh.channelId }
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelCh.pTimer }
+        }
+    }
+
+    #[repr(transparent)]
+    pub struct KernelPhase(profiler_shim::EventDescrV7);
+
+    impl_event!(KernelPhase, EventMetadata::V7);
+
+    impl super::KernelPhase for KernelPhase {
+        #[inline(always)]
+        fn channel_id(&self) -> u8 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelPhase.channelId }
+        }
+
+        #[inline(always)]
+        fn phase_id(&self) -> u8 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelPhase.phaseId }
+        }
+
+        #[inline(always)]
+        fn start_timer(&self) -> u64 {
+            unsafe { self.0 .0.__bindgen_anon_1.kernelPhase.pTimer }
+        }
+    }
+
+    #[cfg(test)]
+    impl KernelPhase {
+        pub fn phase_name(&self) -> &'static str {
+            use super::KernelPhase as _;
+            match self.phase_id() {
+                0 => "initial_sync",
+                1 => "compute",
+                2 => "final_sync",
+                _ => "unknown",
+            }
+        }
+    }
 }
 
 descr_impl_event!(profiler_shim::EventDescrV1, EventMetadata::V1);
@@ -1118,6 +1396,8 @@ impl Version for profiler_shim::EventDescrV1 {
     type P2p = v1::P2p;
     type ProxyOp = v1::ProxyOp;
     type ProxyStep = v1::ProxyStep;
+    type KernelCh = v1::KernelCh;
+    type KernelPhase = v1::KernelPhase;
 
     fn version() -> profiler::Version {
         profiler::Version::V1
@@ -1131,6 +1411,8 @@ impl Version for profiler_shim::EventDescrV2 {
     type P2p = v2::P2p;
     type ProxyOp = v2::ProxyOp;
     type ProxyStep = v2::ProxyStep;
+    type KernelCh = v2::KernelCh;
+    type KernelPhase = v2::KernelPhase;
 
     fn version() -> profiler::Version {
         profiler::Version::V2
@@ -1144,6 +1426,8 @@ impl Version for profiler_shim::EventDescrV3 {
     type P2p = v3::P2p;
     type ProxyOp = v3::ProxyOp;
     type ProxyStep = v3::ProxyStep;
+    type KernelCh = v3::KernelCh;
+    type KernelPhase = v3::KernelPhase;
 
     fn version() -> profiler::Version {
         profiler::Version::V3
@@ -1157,9 +1441,26 @@ impl Version for profiler_shim::EventDescrV4 {
     type P2p = v4::P2p;
     type ProxyOp = v4::ProxyOp;
     type ProxyStep = v4::ProxyStep;
+    type KernelCh = v4::KernelCh;
+    type KernelPhase = v4::KernelPhase;
 
     fn version() -> profiler::Version {
         profiler::Version::V4
+    }
+}
+
+descr_impl_event!(profiler_shim::EventDescrV7, EventMetadata::V7);
+
+impl Version for profiler_shim::EventDescrV7 {
+    type Coll = v7::Coll;
+    type P2p = v7::P2p;
+    type ProxyOp = v7::ProxyOp;
+    type ProxyStep = v7::ProxyStep;
+    type KernelCh = v7::KernelCh;
+    type KernelPhase = v7::KernelPhase;
+
+    fn version() -> profiler::Version {
+        profiler::Version::V7
     }
 }
 
@@ -1240,6 +1541,65 @@ impl ProxyStepState for ProxyStepStateV4 {
     }
 }
 
+#[repr(transparent)]
+pub struct ProxyStepStateV7(profiler_shim::ncclProfilerEventStateArgs_v7_t);
+
+impl ProxyStepStateV7 {
+    /// # Safety
+    ///
+    /// input must be known to be a proxyop variant.
+    pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v7_t) -> &Self {
+        let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v7_t;
+        &*ptr.cast()
+    }
+}
+
+impl ProxyStepState for ProxyStepStateV7 {
+    fn trans_size(&self) -> usize {
+        unsafe { self.0.proxyStep.transSize }
+    }
+}
+
+#[repr(transparent)]
+pub struct KernelChStateV4(profiler_shim::ncclProfilerEventStateArgs_v4_t);
+
+impl KernelChStateV4 {
+    /// # Safety
+    ///
+    /// input must be known to be a kernelCh variant.
+    pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v4_t) -> &Self {
+        let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v4_t;
+        &*ptr.cast()
+    }
+}
+
+impl KernelTimerState for KernelChStateV4 {
+    #[inline(always)]
+    fn stop_timer(&self) -> u64 {
+        unsafe { self.0.kernelCh.pTimer }
+    }
+}
+
+#[repr(transparent)]
+pub struct KernelTimerStateV7(profiler_shim::ncclProfilerEventStateArgs_v7_t);
+
+impl KernelTimerStateV7 {
+    /// # Safety
+    ///
+    /// input must be known to be a kernelPhase/kernelCh variant.
+    pub unsafe fn cast_from_union(u: &profiler_shim::ncclProfilerEventStateArgs_v7_t) -> &Self {
+        let ptr = u as *const profiler_shim::ncclProfilerEventStateArgs_v7_t;
+        &*ptr.cast()
+    }
+}
+
+impl KernelTimerState for KernelTimerStateV7 {
+    #[inline(always)]
+    fn stop_timer(&self) -> u64 {
+        unsafe { self.0.kernelCh.pTimer }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1284,6 +1644,10 @@ mod tests {
                 *n_bytes
             );
         }
+        assert_eq!(datatype_name_to_nbytes(c""), 1);
+        assert_eq!(datatype_name_to_nbytes(c"2"), 1);
+        assert_eq!(datatype_name_to_nbytes(c"4"), 1);
+        assert_eq!(datatype_name_to_nbytes(c"Unknown"), 1);
     }
 
     #[test]
@@ -1291,6 +1655,10 @@ mod tests {
         for (s, t) in NCCLOP_NAME_LOOKUP.iter() {
             assert_eq!(NcclOpType::from_c_str(s), *t);
         }
+        assert_eq!(NcclOpType::from_c_str(c""), NcclOpType::Unknown);
+        assert_eq!(NcclOpType::from_c_str(c"AllToAll"), NcclOpType::Unknown);
+        assert_eq!(NcclOpType::from_c_str(c"Scatter"), NcclOpType::Unknown);
+        assert_eq!(NcclOpType::from_c_str(c"SendRecv"), NcclOpType::Unknown);
     }
 
     #[test]
@@ -1298,5 +1666,62 @@ mod tests {
         for (s, algo) in algo::ALGO_NAME_LOOKUP.iter() {
             assert_eq!(algo::from_name(s), *algo);
         }
+        assert_eq!(algo::from_name(c""), algo::UNKNOWN);
+        assert_eq!(algo::from_name(c"T"), algo::UNKNOWN);
+    }
+
+    #[test]
+    fn test_v7_kernel_phase() {
+        let dummy_descr = profiler_shim::tests::dummy_kernelphase_descr_v7(
+            std::ptr::null_mut(),
+            1, // compute
+            5000,
+        );
+        let phase = unsafe { dummy_descr.cast_to_kernelphase() };
+        assert_eq!(phase.channel_id(), 1);
+        assert_eq!(phase.phase_id(), 1);
+        assert_eq!(phase.start_timer(), 5000);
+        assert_eq!(phase.phase_name(), "compute");
+
+        let dummy_descr_0 =
+            profiler_shim::tests::dummy_kernelphase_descr_v7(std::ptr::null_mut(), 0, 1000);
+        let phase_0 = unsafe { dummy_descr_0.cast_to_kernelphase() };
+        assert_eq!(phase_0.phase_name(), "initial_sync");
+
+        let dummy_descr_2 =
+            profiler_shim::tests::dummy_kernelphase_descr_v7(std::ptr::null_mut(), 2, 9000);
+        let phase_2 = unsafe { dummy_descr_2.cast_to_kernelphase() };
+        assert_eq!(phase_2.phase_name(), "final_sync");
+
+        let dummy_descr_unknown =
+            profiler_shim::tests::dummy_kernelphase_descr_v7(std::ptr::null_mut(), 99, 0);
+        let phase_unknown = unsafe { dummy_descr_unknown.cast_to_kernelphase() };
+        assert_eq!(phase_unknown.phase_name(), "unknown");
+    }
+
+    #[test]
+    fn test_v7_kernel_timer_state() {
+        let mut state_args: profiler_shim::ncclProfilerEventStateArgs_v7_t =
+            unsafe { std::mem::zeroed() };
+        state_args.kernelCh.pTimer = 8888;
+        let timer_state = unsafe { KernelTimerStateV7::cast_from_union(&state_args) };
+        assert_eq!(timer_state.stop_timer(), 8888);
+    }
+
+    #[test]
+    fn test_v4_kernel_ch_state() {
+        let mut state_args: profiler_shim::ncclProfilerEventStateArgs_v4_t =
+            unsafe { std::mem::zeroed() };
+        state_args.kernelCh.pTimer = 7777;
+        let timer_state = unsafe { KernelChStateV4::cast_from_union(&state_args) };
+        assert_eq!(timer_state.stop_timer(), 7777);
+    }
+
+    #[test]
+    fn test_v7_kernel_ch() {
+        let dummy_descr = profiler_shim::tests::dummy_kernelch_descr_v7(std::ptr::null_mut());
+        let kch = unsafe { dummy_descr.cast_to_kernelch() };
+        assert_eq!(kch.channel_id(), 1);
+        assert_eq!(kch.start_timer(), 1000);
     }
 }

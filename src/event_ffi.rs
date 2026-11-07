@@ -13,7 +13,7 @@
 // limitations under the License.
 
 use crate::event::{Event, Group, ProxyStep};
-use crate::profiler::{KernelCh, ProxyOpLocalData};
+use crate::profiler::{self, KernelCh, ProxyOpLocalData};
 use crate::slab;
 
 use static_assertions::const_assert;
@@ -22,6 +22,35 @@ pub type Handle = *mut libc::c_void;
 
 pub const N_TYPE_BITS: u32 = 4;
 pub const HANDLE_TYPE_MASK: usize = (1 << N_TYPE_BITS) - 1;
+
+pub const N_PHASE_ID_BITS: u32 = 2;
+pub const KERNEL_PHASE_SHIFT: u32 = N_TYPE_BITS; // 4
+pub const KERNEL_PHASE_MASK: usize = ((1 << N_PHASE_ID_BITS) - 1) << KERNEL_PHASE_SHIFT; // 0b11_0000
+pub const KERNEL_HANDLE_PTR_MASK: usize = !((1 << (N_TYPE_BITS + N_PHASE_ID_BITS)) - 1); // !0b111111
+
+pub fn make_kernel_phase_handle(ptr: usize, phase_id: u8) -> Handle {
+    let phase_bits = ((phase_id as usize) << KERNEL_PHASE_SHIFT) & KERNEL_PHASE_MASK;
+    (ptr | phase_bits | Type::KernelPhase.to_bits()) as _
+}
+
+pub fn parse_kernel_phase_handle(handle: Handle) -> (usize, u8) {
+    let val = handle as usize;
+    let ptr = val & KERNEL_HANDLE_PTR_MASK;
+    let phase_id = ((val & KERNEL_PHASE_MASK) >> KERNEL_PHASE_SHIFT) as u8;
+    (ptr, phase_id)
+}
+
+/// # Safety
+///
+/// `handle` must be a valid `KernelPhase` handle pointing to a live `KernelCh` on the current thread.
+pub unsafe fn parse_kernel_phase_event<'a>(handle: usize) -> Option<(&'a mut KernelCh, u8)> {
+    let (kernelch_ptr, phase_id) = parse_kernel_phase_handle(handle as Handle);
+    if kernelch_ptr != 0 && (phase_id as usize) < profiler::MAX_KERNEL_PHASES {
+        Some((&mut *(kernelch_ptr as *mut KernelCh), phase_id))
+    } else {
+        None
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Type {
@@ -34,6 +63,7 @@ pub enum Type {
     SmallNcclOp,
     ProxyStep,
     KernelCh,
+    KernelPhase,
 }
 
 impl Type {
@@ -48,6 +78,7 @@ impl Type {
             Type::SmallNcclOp => 0b110,
             Type::ProxyStep => 0b111,
             Type::KernelCh => 0b1000,
+            Type::KernelPhase => 0b1001,
         }
     }
 
@@ -62,6 +93,7 @@ impl Type {
             0b110 => Type::SmallNcclOp,
             0b111 => Type::ProxyStep,
             0b1000 => Type::KernelCh,
+            0b1001 => Type::KernelPhase,
             _ => panic!("unknown bit pattern"),
         }
     }
@@ -77,7 +109,7 @@ pub fn get_handle_type(handle: Handle) -> Type {
     Type::from_bits(type_bits)
 }
 
-fn get_handle_inner(handle: Handle) -> usize {
+pub(crate) fn get_handle_inner(handle: Handle) -> usize {
     (handle as usize) & !HANDLE_TYPE_MASK
 }
 
@@ -96,7 +128,7 @@ pub trait AsFFI: Sized {
 
 const_assert!(std::mem::align_of::<Group>() >= (1 << N_TYPE_BITS));
 const_assert!(std::mem::align_of::<ProxyStep>() >= (1 << N_TYPE_BITS));
-const_assert!(std::mem::align_of::<KernelCh>() >= (1 << N_TYPE_BITS));
+const_assert!(std::mem::align_of::<KernelCh>() >= (1 << (N_TYPE_BITS + N_PHASE_ID_BITS)));
 const_assert!(std::mem::align_of::<ProxyOpLocalData>() >= (1 << N_TYPE_BITS));
 
 impl AsFFI for Event {
@@ -126,6 +158,7 @@ impl AsFFI for Event {
                 let ptr = slab::AllocatedNode::into_raw(op);
                 handle(ptr as _, Type::KernelCh)
             }
+            Event::KernelPhase(h) => h as Handle,
             /*
             Event::ProxyOp(id) => {
                 let v = (id as usize) << N_TYPE_BITS;
@@ -186,6 +219,7 @@ impl AsFFI for Event {
                 let proxyop = slab::AllocatedNode::from_raw(handle);
                 Some(Event::KernelCh(proxyop))
             }
+            Type::KernelPhase => Some(Event::KernelPhase(handle as usize)),
             /*
             Type::ProxyOp => {
                 let handle = get_handle_inner(handle);
@@ -250,7 +284,14 @@ mod tests {
 
     #[test]
     fn type_bits_inv() {
-        let types = [Type::Group, Type::NcclOp, Type::ProxyOp, Type::Dummy];
+        let types = [
+            Type::Group,
+            Type::NcclOp,
+            Type::ProxyOp,
+            Type::Dummy,
+            Type::KernelCh,
+            Type::KernelPhase,
+        ];
         for t in types {
             assert_eq!(Type::from_bits(t.to_bits()), t);
         }
@@ -260,7 +301,14 @@ mod tests {
     fn ffi_handle_inv() {
         // note: the list of handles should have last N_TYPE_BITS zeroed
         let handles = [0, 48, 1024, 0xabcd1230, 0xfffffff0];
-        let types = [Type::Group, Type::NcclOp, Type::ProxyOp, Type::Dummy];
+        let types = [
+            Type::Group,
+            Type::NcclOp,
+            Type::ProxyOp,
+            Type::Dummy,
+            Type::KernelCh,
+            Type::KernelPhase,
+        ];
         for h in handles {
             for t in types {
                 let ffi = handle(h, t);
@@ -306,7 +354,8 @@ mod tests {
             unsafe { proxyop_descr.cast_to_proxyop() },
             false,
             false,
-            Some(profiler::Communicator::new()),
+            /* comm_hash = */ None,
+            /* net_bytes = */ None,
         )));
         let handle = Event::into_ffi(event);
         // SAFETY: handle is valid return value of into_ffi()
@@ -315,6 +364,65 @@ mod tests {
             assert!(proxydata.info.is_send);
         } else {
             panic!("failed get proxyop from ffi");
+        }
+    }
+
+    #[test]
+    fn kernel_phase_handle_encoding() {
+        let ptrs = [0x1000_0040, 0xabcd_0000, 0x1234_5680];
+        for ptr in ptrs {
+            for phase_id in 0..=3 {
+                let handle = make_kernel_phase_handle(ptr, phase_id);
+                assert_eq!(get_handle_type(handle), Type::KernelPhase);
+                let (parsed_ptr, parsed_phase) = parse_kernel_phase_handle(handle);
+                assert_eq!(parsed_ptr, ptr);
+                assert_eq!(parsed_phase, phase_id);
+            }
+        }
+    }
+
+    #[test]
+    fn kernel_phase_event_mock() {
+        let kch_event = Event::KernelCh(slab::AllocatedNode::new(KernelCh {
+            parent_op: Some(0x17e9),
+            info: profiler::KernelChInfo {
+                channel_id: 3,
+                start_timer: 1000,
+                stop_timer: 0,
+                phases: Default::default(),
+            },
+        }));
+        let kch_ffi = Event::into_ffi(kch_event);
+        assert_eq!(get_handle_type(kch_ffi), Type::KernelCh);
+        let ptr = get_handle_inner(kch_ffi);
+
+        let phase_id = 1;
+        let handle = make_kernel_phase_handle(ptr, phase_id);
+        let event = Event::KernelPhase(handle as usize);
+        let ffi_handle = Event::into_ffi(event);
+        assert_eq!(get_handle_type(ffi_handle), Type::KernelPhase);
+        // SAFETY: ffi_handle is valid return value of into_ffi()
+        if let Some(Event::KernelPhase(h)) = unsafe { Event::from_ffi(ffi_handle) } {
+            let (parsed_ptr, parsed_phase) = parse_kernel_phase_handle(h as Handle);
+            assert_eq!(parsed_ptr, ptr);
+            assert_eq!(parsed_phase, phase_id);
+
+            // SAFETY: h points to the live KernelCh allocated above
+            let (kch_ref, p_id) = unsafe { parse_kernel_phase_event(h) }.unwrap();
+            assert_eq!(p_id, phase_id);
+            assert_eq!(kch_ref.info.channel_id, 3);
+            kch_ref.info.phases[p_id as usize].start_timer = 1200;
+            kch_ref.info.phases[p_id as usize].stop_timer = 1800;
+        } else {
+            panic!("failed to get KernelPhase from ffi");
+        }
+
+        // Reclaim the KernelCh handle and verify mutated phase timestamps
+        if let Some(Event::KernelCh(kch)) = unsafe { Event::from_ffi(kch_ffi) } {
+            assert_eq!(kch.info.phases[1].start_timer, 1200);
+            assert_eq!(kch.info.phases[1].stop_timer, 1800);
+        } else {
+            panic!("failed to get KernelCh from ffi");
         }
     }
 }

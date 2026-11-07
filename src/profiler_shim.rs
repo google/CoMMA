@@ -67,6 +67,17 @@ impl AsRef<ncclProfilerEventDescr_v4_t> for EventDescrV4 {
     }
 }
 
+#[repr(transparent)]
+#[derive(Debug, Clone)]
+pub struct EventDescrV7(pub ncclProfilerEventDescr_v7_t);
+
+impl AsRef<ncclProfilerEventDescr_v7_t> for EventDescrV7 {
+    #[inline(always)]
+    fn as_ref(&self) -> &ncclProfilerEventDescr_v7_t {
+        &self.0
+    }
+}
+
 pub type EventDescr = EventDescrV2;
 
 // alias of `ncclProfilerEventState_vX_t` to make the name shorter
@@ -111,6 +122,12 @@ pub mod proxy_event_state {
         pub const RECV_WAIT: u32 = ncclProfilerEventState_t_ncclProfilerProxyStepRecvWait;
         pub const RECV_FLUSH_WAIT: u32 =
             ncclProfilerEventState_t_ncclProfilerProxyStepRecvFlushWait;
+    }
+
+    pub mod v7 {
+        pub use super::v4::*;
+        use super::*;
+        pub const KERNEL_PHASE_STOP: u32 = ncclProfilerEventState_t_ncclProfilerKernelPhaseStop;
     }
 }
 
@@ -157,5 +174,42 @@ pub(crate) mod tests {
             proxyop.isSend = 1;
         }
         EventDescrV2(descr)
+    }
+
+    pub(crate) fn dummy_kernelch_descr_v7(parent_obj: *mut std::ffi::c_void) -> EventDescrV7 {
+        let mut descr: ncclProfilerEventDescr_v7_t = unsafe { std::mem::zeroed() };
+        descr.type_ = ncclProfileKernelCh as _;
+        descr.parentObj = parent_obj;
+        descr.rank = 0;
+        unsafe {
+            let kernel_ch = &mut descr.__bindgen_anon_1.kernelCh;
+            kernel_ch.channelId = 1;
+            kernel_ch.pTimer = 1000;
+        }
+        EventDescrV7(descr)
+    }
+
+    pub(crate) fn dummy_kernelphase_descr_v7(
+        parent_obj: *mut std::ffi::c_void,
+        phase_id: u8,
+        p_timer: u64,
+    ) -> EventDescrV7 {
+        let mut descr: ncclProfilerEventDescr_v7_t = unsafe { std::mem::zeroed() };
+        descr.type_ = ncclProfileKernelPhase as _;
+        descr.parentObj = parent_obj;
+        descr.rank = 0;
+        unsafe {
+            let kernel_phase = &mut descr.__bindgen_anon_1.kernelPhase;
+            kernel_phase.channelId = 1;
+            kernel_phase.phaseId = phase_id;
+            kernel_phase.phaseName = match phase_id {
+                0 => c"initial_sync".as_ptr(),
+                1 => c"compute".as_ptr(),
+                2 => c"final_sync".as_ptr(),
+                _ => c"unknown".as_ptr(),
+            };
+            kernel_phase.pTimer = p_timer;
+        }
+        EventDescrV7(descr)
     }
 }
